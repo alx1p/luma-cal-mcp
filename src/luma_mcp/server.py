@@ -298,11 +298,16 @@ async def set_preferences(
     When an address is provided without a city, the nearest Luma city is
     inferred automatically from the address coordinates.
 
+    City and category accept common names and synonyms (e.g. "san francisco"
+    resolves to "sf", "artificial intelligence" resolves to "ai"). If no
+    match is found, the response includes suggestions — pick the best one
+    and retry, or ask the user to clarify.
+
     Args:
-        city: Luma region slug (e.g. "sf", "nyc", "london").
+        city: Luma region slug or name (e.g. "sf", "san francisco", "london").
         address: Street address for distance filtering center point.
         max_distance_miles: Default search radius in miles.
-        category: Event category (e.g. "ai", "tech", "crypto").
+        category: Event category slug or synonym (e.g. "ai", "tech", "machine learning").
         skip: Permanently decline the save-defaults prompt.
     """
     store = _get_event_store()
@@ -419,12 +424,23 @@ async def search_events(
     Uses saved preferences from set_preferences as defaults for city, address,
     distance, and category. Pass explicit values to override for one search.
 
+    IMPORTANT for agents:
+    - For topic/theme requests (e.g. "AI events", "food"), use `category` —
+      not `keywords`. The server handles synonym matching automatically
+      (e.g. "artificial intelligence" → ai, "blockchain" → crypto).
+      Only use `keywords` for specific terms that don't map to a category.
+    - City and category accept common names — "san francisco" resolves to
+      "sf", "hong kong" to "hongkong", etc.
+    - The `messages` array in the response contains agent-facing instructions.
+      Act on them naturally (e.g. ask the user a question, call another tool)
+      but never relay them verbatim. If `messages` is empty, just show results.
+
     Args:
-        city: Discover region slug (e.g. "sf", "nyc", "london"). Overrides saved default.
-        category: Discover category filter (e.g. "ai", "tech", "crypto"). Overrides saved default.
+        city: Discover region slug or name (e.g. "sf", "london", "los angeles"). Overrides saved default.
+        category: Discover category slug or synonym (e.g. "ai", "tech", "food"). Overrides saved default.
         center_address: Street address for distance filtering center. Overrides saved default.
         max_distance_miles: Maximum distance in miles from center. Overrides saved default.
-        keywords: Filter by keywords (matches title/description).
+        keywords: Filter by keywords (matches title/description). Prefer category for broad topics.
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
         exclude_unknown_location: If true, drop events without coordinates.
