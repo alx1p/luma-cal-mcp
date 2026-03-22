@@ -6,7 +6,7 @@ A [FastMCP](https://gofastmcp.com) server that discovers events from [Luma](http
 
 | Tool | What it does |
 |------|-------------|
-| `search_events` | Unified search across Discover and subscribed calendars. Filter by city/region, category, distance from a point (coordinates or address), keywords, and recency (`added_within_days`, `new_only`). Handles login flow for subscribed calendars automatically. |
+| `search_events` | Unified search across Discover and subscribed calendars. Filter by city/region, category, distance from a point (coordinates or address), keywords, and recency (`added_within_days`, `new_only`). Handles login and default-preference setup automatically. Event times are returned in each event's local timezone. |
 | `get_event` | Fetch full details for a single event by API id or `lu.ma` URL. Includes RSVP link. |
 | `export_event_ics` | Generate an ICS string for any event — paste into Apple Calendar, Google Calendar, Outlook, etc. |
 
@@ -36,17 +36,23 @@ uv pip install -e ".[auth]"
 playwright install chromium
 ```
 
-On first use, `search_events` will prompt you to log in via a browser window. The session cookie is stored locally in SQLite and re-validated automatically. No manual cookie extraction needed.
+On first use, `search_events` walks you through setup one step at a time:
+
+1. **Login prompt** — asks whether to log in for subscribed calendars. The session cookie is stored locally in SQLite and re-validated automatically.
+2. **Defaults prompt** — asks for preferred address, city, category, and distance. Stored in SQLite and used on subsequent calls.
+
+Each prompt appears once per call, so the agent handles them sequentially rather than all at once.
 
 ### Configure
 
-Set your defaults at runtime via `search_events` parameters. These are stored in the local SQLite DB and persist across restarts:
+Defaults are set at runtime via `search_events` parameters and persist across restarts:
 
 - `set_default_address="3180 18th St, San Francisco"` — your home location for distance filtering.
 - `set_default_category="ai"` — event type to browse by default.
 - `set_default_city="sf-bay-area"` — Discover region.
+- `set_default_max_distance=15` — radius in miles.
 
-On first run with no defaults configured, the server prompts you to set these. Env vars (see `.env.example`) are also supported as fallbacks.
+Env vars (see `.env.example`) are also supported as fallbacks.
 
 ### Run
 
@@ -64,7 +70,7 @@ Subscribed calendars require a Luma session cookie. The server handles this auto
 
 **How it works:**
 
-1. **First run** — `search_events` returns Discover results plus a message asking whether you'd like to log in for subscribed calendars. The agent relays this prompt in chat.
+1. **First call** — the login prompt is the first setup question. The agent relays it in chat.
 2. **Login** — call `search_events` with `login=true`. A Chromium browser opens to `lu.ma/signin`; log in normally. The session cookie is captured and stored in the local SQLite DB.
 3. **Decline** — call `search_events` with `skip_login_days=N` to defer (0 = ask next time, -1 = never).
 4. **Returning user, cookie expired** — the browser opens automatically for re-authentication (you opted in by logging in previously).
@@ -119,6 +125,10 @@ Without logging in, the server still works — Discover is fully available with 
 Provide a center point as coordinates (`center_lat` + `center_lon`) or a street address (`center_address`), plus `max_distance_miles`. Events beyond the radius are excluded. Events without location data are included by default (with `distance_miles: null`), or excluded if `exclude_unknown_location` is set.
 
 Geocoding uses [Nominatim](https://nominatim.org/) (free, OpenStreetMap) by default. For higher volume, set `GEOCODING_PROVIDER=google` or `mapbox` with the corresponding `GEOCODING_API_KEY`.
+
+## Event Times
+
+Event times (`start_at`, `end_at`) are returned in each event's local timezone as reported by Luma (e.g. `America/Los_Angeles`), not UTC. The `timezone` field is included in every result for reference.
 
 ## Limitations
 

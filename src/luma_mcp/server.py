@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
 
@@ -81,13 +82,15 @@ def _resolve_defaults(
     set_default_address: Optional[str],
     set_default_max_distance: Optional[float],
     skip_defaults: bool,
+    suppress_prompt: bool = False,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[float]]:
     """Resolve city/category/address/distance with precedence: param > DB > env.
 
     Persists any set_default_* values. Keeps prompting to save defaults
     until at least one is stored or the user declines.
 
-    Returns (city, category, address, max_distance_miles).
+    ``suppress_prompt`` silently skips the prompt for this call without
+    persisting a decline (used when another prompt like login was shown first).
     """
     if skip_defaults:
         store.set_setting("defaults_declined", "true")
@@ -113,7 +116,7 @@ def _resolve_defaults(
 
     has_stored = stored_city or stored_category or stored_address or stored_distance
     declined = _stored_default(store, "defaults_declined")
-    if not has_stored and not declined:
+    if not has_stored and not declined and not suppress_prompt:
         save_hints: list[str] = []
         if city and not stored_city:
             save_hints.append(f'  set_default_city="{city}"')
@@ -157,14 +160,14 @@ async def _resolve_session(
     no_login: bool,
     login: bool,
     skip_login_days: Optional[int],
-) -> Optional[str]:
+) -> tuple[Optional[str], bool]:
     """Determine the session cookie to use for subscribed calendars.
 
-    Returns the cookie value if available, or None to skip subscribed calendars.
-    May add user-facing prompts to ``messages``.
+    Returns (cookie, prompted).  ``prompted`` is True when a login prompt was
+    added to messages, so callers can defer other prompts.
     """
     if no_login:
-        return None
+        return None, False
 
     # Handle explicit skip_login_days from a prior prompt answer
     if skip_login_days is not None:
@@ -175,19 +178,19 @@ async def _resolve_session(
         else:
             until = datetime.now(tz=timezone.utc) + timedelta(days=skip_login_days)
             store.set_setting("luma_login_declined_until", until.isoformat())
-        return None
+        return None, False
 
     # Handle explicit login=true from a prior prompt answer
     if login:
         cookie = _do_browser_login(store, messages)
-        return cookie
+        return cookie, False
 
     # Check if user previously declined and window is still active
     declined_row = store.get_setting("luma_login_declined_until")
     if declined_row:
         declined_until = datetime.fromisoformat(declined_row[0])
         if datetime.now(tz=timezone.utc) < declined_until:
-            return None
+            return None, False
         # Window expired — clear it so we re-prompt
         store.delete_setting("luma_login_declined_until")
 
@@ -196,7 +199,7 @@ async def _resolve_session(
     if cookie:
         valid = await _validate_if_stale(store, cookie, messages)
         if valid:
-            return cookie
+            return cookie, False
         # Cookie expired — clear it
         store.delete_setting("luma_session")
         store.delete_setting("luma_session_validated")
@@ -209,7 +212,7 @@ async def _resolve_session(
             "Your Luma session expired. Opening browser to re-authenticate..."
         )
         cookie = _do_browser_login(store, messages)
-        return cookie
+        return cookie, False
 
     # First time ever, or previously declined and window expired — prompt
     messages.append(
@@ -218,7 +221,7 @@ async def _resolve_session(
         "Call search_events with login=true to log in, or "
         "skip_login_days=N to decline (0 = ask next time, -1 = never ask again)."
     )
-    return None
+    return None, True
 
 
 async def _validate_if_stale(
@@ -329,6 +332,17 @@ async def search_events(
 
     store = _get_event_store()
 
+    # Resolve session cookie first — login prompt takes priority over defaults
+    session_cookie: Optional[str] = None
+    login_prompted = False
+    want_subscribed = source in ("all", "subscribed")
+    if want_subscribed:
+        session_cookie, login_prompted = await _resolve_session(
+            store, messages,
+            no_login=no_login, login=login, skip_login_days=skip_login_days,
+        )
+
+    # Resolve preferences — defer defaults prompt if login was just prompted
     city, category, center_address, max_dist = _resolve_defaults(
         store, cfg, messages,
         city=city, category=category, center_address=center_address,
@@ -338,6 +352,7 @@ async def search_events(
         set_default_address=set_default_address,
         set_default_max_distance=set_default_max_distance,
         skip_defaults=skip_defaults,
+        suppress_prompt=login_prompted,
     )
 
     after_dt = _parse_dt(after)
@@ -349,15 +364,6 @@ async def search_events(
         center_address,
         geocode_fn=_geocode_fn,
     )
-
-    # Resolve session cookie for subscribed calendars
-    session_cookie: Optional[str] = None
-    want_subscribed = source in ("all", "subscribed")
-    if want_subscribed:
-        session_cookie = await _resolve_session(
-            store, messages,
-            no_login=no_login, login=login, skip_login_days=skip_login_days,
-        )
 
     if source in ("all", "discover"):
         try:
@@ -506,12 +512,23 @@ async def export_event_ics(event_id: Optional[str] = None, url: Optional[str] = 
 # --------------------------------------------------------------------------
 
 
+def _local_dt(dt: datetime, tz_name: Optional[str]) -> str:
+    """Format a UTC datetime in the event's local timezone as a human-friendly ISO string."""
+    if tz_name:
+        try:
+            local = dt.astimezone(ZoneInfo(tz_name))
+            return local.isoformat()
+        except (KeyError, ValueError):
+            pass
+    return dt.isoformat()
+
+
 def _event_summary(event: LumaEvent) -> dict:
     return {
         "id": event.id,
         "title": event.title,
-        "start_at": event.start_at.isoformat(),
-        "end_at": event.end_at.isoformat() if event.end_at else None,
+        "start_at": _local_dt(event.start_at, event.timezone),
+        "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
         "location": event.location_label,
         "full_address": event.full_address,
@@ -526,8 +543,8 @@ def _event_detail(event: LumaEvent) -> dict:
         "id": event.id,
         "title": event.title,
         "description": event.description,
-        "start_at": event.start_at.isoformat(),
-        "end_at": event.end_at.isoformat() if event.end_at else None,
+        "start_at": _local_dt(event.start_at, event.timezone),
+        "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
         "lat": event.lat,
         "lon": event.lon,
