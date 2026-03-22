@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -200,7 +201,7 @@ async def _resolve_session(
 
     # Handle explicit login=true from a prior prompt answer
     if login:
-        cookie = _do_browser_login(store, messages)
+        cookie = await _do_browser_login(store, messages)
         return cookie, False
 
     # Check if user previously declined and window is still active
@@ -226,7 +227,7 @@ async def _resolve_session(
         messages.append(
             "Your Luma session expired. Opening browser to re-authenticate..."
         )
-        cookie = _do_browser_login(store, messages)
+        cookie = await _do_browser_login(store, messages)
         return cookie, False
 
     # First time ever, or previously declined and window expired — prompt
@@ -262,11 +263,13 @@ async def _validate_if_stale(
     return False
 
 
-def _do_browser_login(store: EventStore, messages: list[str]) -> Optional[str]:
+async def _do_browser_login(store: EventStore, messages: list[str]) -> Optional[str]:
     """Launch browser login, persist cookie on success."""
     try:
         from luma_mcp.auth import browser_login
-        cookie = browser_login()
+
+        # Sync Playwright cannot run on the asyncio event loop (FastMCP tools are async).
+        cookie = await asyncio.to_thread(browser_login)
         store.set_setting("luma_session", cookie)
         store.set_setting("luma_session_validated", datetime.now(tz=timezone.utc).isoformat())
         store.set_setting("luma_login_had_cookie", "true")
