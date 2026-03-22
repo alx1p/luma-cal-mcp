@@ -23,9 +23,16 @@ BASE_URL = "https://api.lu.ma"
 
 class LumaWebClient:
     def __init__(self, session_cookie: Optional[str] = None) -> None:
-        headers: dict[str, str] = {"accept": "application/json"}
+        headers: dict[str, str] = {
+            "accept": "application/json",
+            "origin": "https://lu.ma",
+            "referer": "https://lu.ma/",
+        }
         if session_cookie:
-            headers["cookie"] = session_cookie
+            if "=" in session_cookie:
+                headers["cookie"] = session_cookie
+            else:
+                headers["cookie"] = f"luma.auth-session-key={session_cookie}"
         self._client = httpx.AsyncClient(
             base_url=BASE_URL, headers=headers, timeout=30.0
         )
@@ -102,15 +109,14 @@ class LumaWebClient:
         if not self._has_session:
             return []
 
-        # First get the list of subscribed calendars
-        resp = await self._client.get("/calendar/get-subscribed-calendars")
+        resp = await self._client.get("/home/get-subscribed-calendars")
         if resp.status_code in (401, 403, 404):
             return []
         resp.raise_for_status()
         data = resp.json()
 
         calendar_ids: list[str] = []
-        for entry in data.get("entries", []):
+        for entry in data.get("infos", []):
             cal = entry.get("calendar", {})
             cal_id = cal.get("api_id")
             if cal_id:
