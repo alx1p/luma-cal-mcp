@@ -11,7 +11,7 @@ Luma's Discover API has two endpoints that behave very differently:
 
 This MCP uses both via two search modes:
 
-- **Home mode** (default, no `city` param) — searches your preferred categories via the Category API. Deep, rich results filtered by your stored address and distance.
+- **Home mode** (default, no `city` param) — searches your preferred categories via the Category API. Deep, rich results filtered by address and distance.
 - **Travel mode** (pass a `city`) — fetches the curated top events for that city via the Place API.
 
 On first run, the server returns popular events near you (geo-biased by IP), then walks you through setting up categories, address, and login for progressively richer results.
