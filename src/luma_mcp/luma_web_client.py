@@ -56,8 +56,8 @@ class LumaWebClient:
         a ~30-day window from ``after`` (or now) when ``before`` is not set.
         """
         now = datetime.now(tz=timezone.utc)
-        effective_after = after or now
-        effective_before = before or (effective_after + timedelta(days=_DEFAULT_WINDOW_DAYS))
+        effective_after = _ensure_utc(after) if after else now
+        effective_before = _ensure_utc(before) if before else (effective_after + timedelta(days=_DEFAULT_WINDOW_DAYS))
 
         events: list[LumaEvent] = []
         cursor: Optional[str] = None
@@ -202,6 +202,13 @@ class LumaWebClient:
 # ------------------------------------------------------------------
 # Parsing helpers (web API field names differ from the official API)
 # ------------------------------------------------------------------
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    """Ensure a datetime is timezone-aware, defaulting to UTC if naive."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _parse_web_event(entry: dict, *, source: EventSource) -> Optional[LumaEvent]:

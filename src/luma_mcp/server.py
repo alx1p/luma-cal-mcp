@@ -81,7 +81,8 @@ def _resolve_defaults(
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Resolve city/category/address with precedence: param > DB > env.
 
-    Persists any set_default_* values and prompts on first run if no defaults exist.
+    Persists any set_default_* values. On first run, always prompts to save
+    defaults — even when explicit values are passed.
     """
     if set_default_city is not None:
         store.set_setting("default_city", set_default_city)
@@ -90,27 +91,58 @@ def _resolve_defaults(
     if set_default_address is not None:
         store.set_setting("default_center_address", set_default_address)
 
-    eff_city = city or _stored_default(store, "default_city") or cfg.default_city
-    eff_category = category or _stored_default(store, "default_category") or cfg.default_category
-    eff_address = (
-        center_address
-        or _stored_default(store, "default_center_address")
-        or cfg.default_center_address
-    )
+    stored_city = _stored_default(store, "default_city")
+    stored_category = _stored_default(store, "default_category")
+    stored_address = _stored_default(store, "default_center_address")
 
-    # First-run prompt when nothing is configured
-    has_any = eff_city or eff_category or eff_address
+    eff_city = city or stored_city or cfg.default_city
+    eff_category = category or stored_category or cfg.default_category
+    eff_address = center_address or stored_address or cfg.default_center_address
+
+    has_stored = stored_city or stored_category or stored_address
     already_prompted = _stored_default(store, "preferences_prompted")
-    if not has_any and not already_prompted:
+    if not has_stored and not already_prompted:
         store.set_setting("preferences_prompted", "true")
-        messages.append(
-            "No default location or event type configured. "
-            "You can set persistent defaults by calling search_events with:\n"
-            "  set_default_address=\"your address\"\n"
-            "  set_default_category=\"ai\" (or tech, crypto, food-drink, etc.)\n"
-            "  set_default_city=\"sf-bay-area\" (or new-york, los-angeles, etc.)\n\n"
-            "These are saved locally and used on future calls when you don't pass them explicitly."
-        )
+
+        # Suggest saving explicitly-passed values
+        save_hints: list[str] = []
+        if city and not stored_city:
+            save_hints.append(f'  set_default_city="{city}"')
+        if center_address and not stored_address:
+            save_hints.append(f'  set_default_address="{center_address}"')
+        if category and not stored_category:
+            save_hints.append(f'  set_default_category="{category}"')
+
+        if save_hints:
+            messages.append(
+                "Want to save these as your defaults for future searches? "
+                "Call search_events with:\n"
+                + "\n".join(save_hints)
+                + "\n\nYou can also set any you didn't pass:\n"
+                "  set_default_address=\"your address\"\n"
+                "  set_default_category=\"ai\" (or tech, crypto, food-drink, etc.)\n"
+                "  set_default_city=\"sf-bay-area\" (or new-york, los-angeles, etc.)"
+            )
+        else:
+            messages.append(
+                "No default location or event type configured. "
+                "You can set persistent defaults by calling search_events with:\n"
+                "  set_default_address=\"your address\"\n"
+                "  set_default_category=\"ai\" (or tech, crypto, food-drink, etc.)\n"
+                "  set_default_city=\"sf-bay-area\" (or new-york, los-angeles, etc.)\n\n"
+                "These are saved locally and used on future calls when you don't pass them explicitly."
+            )
+
+        # Also prompt for login on first run
+        had_cookie = _stored_default(store, "luma_login_had_cookie")
+        declined = _stored_default(store, "luma_login_declined_until")
+        if not had_cookie and not declined:
+            messages.append(
+                "Would you like to log in to Luma to also see events from your "
+                "subscribed calendars? (Y/n)\n\n"
+                "Call search_events with login=true to log in, or "
+                "skip_login_days=N to decline (0 = ask next time, -1 = never ask again)."
+            )
 
     return eff_city, eff_category, eff_address
 
@@ -248,6 +280,7 @@ async def search_events(
     after: Optional[str] = None,
     before: Optional[str] = None,
     exclude_unknown_location: bool = False,
+    latin_only: bool = True,
     added_within_days: Optional[float] = None,
     new_only: bool = False,
     login: bool = False,
@@ -274,6 +307,7 @@ async def search_events(
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
         exclude_unknown_location: If true, drop events that have no coordinates.
+        latin_only: If true (default), filter out events whose titles are predominantly non-Latin script (e.g. Chinese, Korean, Arabic). Set to false to include all languages.
         added_within_days: Only return events first seen within this many days (e.g. 5). Requires prior runs to populate the store.
         new_only: If true, only return events that have never been seen before (first appearance this run).
         login: Set to true to open a browser and log in to Luma for subscribed calendar access.
@@ -300,8 +334,8 @@ async def search_events(
         set_default_address=set_default_address,
     )
 
-    after_dt = datetime.fromisoformat(after) if after else None
-    before_dt = datetime.fromisoformat(before) if before else None
+    after_dt = _parse_dt(after)
+    before_dt = _parse_dt(before)
 
     resolved_lat, resolved_lon = resolve_center(
         center_lat or cfg.default_center_lat,
@@ -359,6 +393,9 @@ async def search_events(
 
     if kw:
         events = filter_by_keywords(events, kw)
+
+    if latin_only:
+        events = [e for e in events if _is_latin_text(f"{e.title} {e.description}")]
 
     events.sort(key=lambda e: e.start_at)
 
@@ -496,6 +533,25 @@ def _event_detail(event: LumaEvent) -> dict:
         "rsvp_url": event.canonical_url,
         "source": event.source.value,
     }
+
+
+def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO 8601 string, defaulting to UTC if no timezone is given."""
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_latin_text(text: str) -> bool:
+    """Return True if the majority of alphabetic characters are Latin-script."""
+    alpha = [c for c in text if c.isalpha()]
+    if not alpha:
+        return True
+    latin = sum(1 for c in alpha if c < "\u0250")
+    return latin / len(alpha) > 0.5
 
 
 def _extract_event_id_from_url(url: str) -> str:
