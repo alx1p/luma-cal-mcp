@@ -575,24 +575,24 @@ async def export_event_ics(event_id: Optional[str] = None, url: Optional[str] = 
 # --------------------------------------------------------------------------
 
 
-def _local_dt(dt: datetime, tz_name: Optional[str]) -> str:
-    """Format a UTC datetime in the event's local timezone as a human-friendly ISO string."""
-    if tz_name:
-        try:
-            local = dt.astimezone(ZoneInfo(tz_name))
-            return local.isoformat()
-        except (KeyError, ValueError):
-            pass
-    return dt.isoformat()
+def _local_dt(dt: datetime, _tz_name: Optional[str] = None) -> str:
+    """Format a datetime in the user's system timezone."""
+    return dt.astimezone().isoformat()
 
 
 _STATE_ZIP_RE = re.compile(r"^[A-Z]{2}\s+\d{4,5}")
 
 
-def _esc(text: Optional[str]) -> Optional[str]:
-    """Escape pipe characters so values don't break markdown tables."""
+_MAX_TITLE_LEN = 50
+_MAX_LOCATION_LEN = 32
+
+
+def _esc(text: Optional[str], max_len: int = 0) -> Optional[str]:
+    """Escape pipe characters and optionally truncate with ellipsis."""
     if text is None:
         return None
+    if max_len and len(text) > max_len:
+        text = text[:max_len].rstrip() + "…"
     return text.replace("|", "\\|")
 
 
@@ -603,11 +603,14 @@ def _extract_city(full_address: Optional[str]) -> Optional[str]:
       '123 Main St, Palo Alto, CA 94301, USA' → 'Palo Alto'
       'San Francisco, CA 94102' → 'San Francisco'
       'San Francisco, CA' → 'San Francisco'
+      '550 Laguna St, San Francisco + Full Studio' → 'San Francisco'
       'Online' → None
     """
     if not full_address:
         return None
-    parts = [p.strip() for p in full_address.split(",")]
+    # Strip anything after '+' (manual venue annotations like "+ Full Studio")
+    cleaned = re.split(r"\s*\+\s*", full_address)[0].strip().rstrip(",")
+    parts = [p.strip() for p in cleaned.split(",")]
     # Find the part just before a state+zip pattern
     for i in range(1, len(parts)):
         if _STATE_ZIP_RE.match(parts[i]):
@@ -615,10 +618,18 @@ def _extract_city(full_address: Optional[str]) -> Optional[str]:
     # "City, ST" pattern — first part is the city if second looks like a state
     if len(parts) == 2 and len(parts[1].strip()) == 2 and parts[1].strip().isalpha():
         return parts[0]
+    # "Street, City" — second part is likely the city if first starts with a digit
+    if len(parts) == 2 and parts[0] and parts[0][0].isdigit():
+        return parts[1]
     # 3+ parts without state+zip: second-to-last is likely the city
     if len(parts) >= 3:
         return parts[-2]
     return None
+
+
+_KNOWN_VENUES: dict[str, str] = {
+    "550 laguna st, san francisco": "The Commons",
+}
 
 
 def _venue_name(label: Optional[str]) -> Optional[str]:
@@ -626,6 +637,10 @@ def _venue_name(label: Optional[str]) -> Optional[str]:
     if not label:
         return None
     stripped = label.strip()
+    lower = stripped.lower()
+    for prefix, name in _KNOWN_VENUES.items():
+        if lower.startswith(prefix):
+            return name
     if stripped and stripped[0].isdigit():
         return None
     return stripped
@@ -645,11 +660,11 @@ def _event_summary(event: LumaEvent) -> dict:
 
     d: dict = {
         "id": event.id,
-        "title": _esc(event.title),
+        "title": _esc(event.title, _MAX_TITLE_LEN),
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
-        "location": _esc(location) if location else None,
+        "location": _esc(location, _MAX_LOCATION_LEN) if location else None,
         "url": event.canonical_url,
     }
     if event.distance_miles is not None:
