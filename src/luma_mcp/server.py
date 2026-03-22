@@ -586,6 +586,13 @@ def _local_dt(dt: datetime, tz_name: Optional[str]) -> str:
 _STATE_ZIP_RE = re.compile(r"^[A-Z]{2}\s+\d{4,5}")
 
 
+def _esc(text: Optional[str]) -> Optional[str]:
+    """Escape pipe characters so values don't break markdown tables."""
+    if text is None:
+        return None
+    return text.replace("|", "\\|")
+
+
 def _extract_city(full_address: Optional[str]) -> Optional[str]:
     """Pull the city name from a full address string.
 
@@ -623,7 +630,7 @@ def _venue_name(label: Optional[str]) -> Optional[str]:
 
 def _event_summary(event: LumaEvent) -> dict:
     venue = _venue_name(event.location_label)
-    city = _extract_city(event.full_address) or _extract_city(event.location_label)
+    city = event.city or _extract_city(event.full_address) or _extract_city(event.location_label)
     addr_lower = (event.full_address or "").lower()
     label_lower = (event.location_label or "").lower()
     if "online" in addr_lower or "online" in label_lower:
@@ -635,11 +642,11 @@ def _event_summary(event: LumaEvent) -> dict:
 
     d: dict = {
         "id": event.id,
-        "title": event.title,
+        "title": _esc(event.title),
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
-        "location": location,
+        "location": _esc(location) if location else None,
         "url": event.canonical_url,
     }
     if event.distance_miles is not None:
@@ -655,7 +662,7 @@ def _event_detail(event: LumaEvent) -> dict:
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
-        "city": _extract_city(event.full_address),
+        "city": event.city or _extract_city(event.full_address) or _extract_city(event.location_label),
         "lat": event.lat,
         "lon": event.lon,
         "location_label": event.location_label,

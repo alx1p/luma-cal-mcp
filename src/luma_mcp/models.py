@@ -31,6 +31,7 @@ class LumaEvent(BaseModel):
 
     lat: Optional[float] = None
     lon: Optional[float] = None
+    city: Optional[str] = None
     location_label: Optional[str] = None
     full_address: Optional[str] = None
 

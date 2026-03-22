@@ -268,6 +268,7 @@ def _parse_web_event(
         timezone=ev.get("timezone"),
         lat=coord.get("latitude"),
         lon=coord.get("longitude"),
+        city=geo.get("city"),
         location_label=geo.get("address") or geo.get("description"),
         full_address=geo.get("full_address"),
         cover_url=ev.get("cover_url"),
