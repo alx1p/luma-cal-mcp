@@ -53,10 +53,10 @@ playwright install chromium
 
 ### First run
 
-On first use, the server walks you through setup one prompt at a time (in this order):
+On first use, the raw Discover feed returns hundreds of popular events near you (geo-biased by IP). The server then walks you through setup one prompt at a time to narrow results:
 
-1. **Categories** — asks which topics interest you (from: tech, ai, food, arts, climate, fitness, wellness, crypto).
-2. **Address** — asks for your location and preferred search radius for distance filtering.
+1. **Address** — asks for your location and preferred search radius, which dramatically reduces the result set to events near you.
+2. **Categories** — asks which topics interest you (from: tech, ai, food, arts, climate, fitness, wellness, crypto) for focused discovery.
 3. **Login** — asks whether to log in for subscribed calendars.
 
 Each prompt appears after returning results, so you see events immediately. After you configure a preference, the search reruns automatically and the next prompt appears. You can respond "not now" (prompt reappears next time) or "never" (permanently dismissed).
@@ -66,8 +66,8 @@ Each prompt appears after returning results, so you see events immediately. Afte
 Use `set_preferences` to save defaults that persist across restarts:
 
 ```
-set_preferences(categories=["ai", "tech"])
 set_preferences(address="3180 18th St, San Francisco", max_distance_miles=15)
+set_preferences(categories=["ai", "tech"])
 ```
 
 ### Run

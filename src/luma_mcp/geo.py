@@ -42,3 +42,21 @@ def filter_by_distance(
 
     return result
 
+
+def filter_by_keywords(
+    events: list[LumaEvent],
+    keywords: list[str],
+) -> list[LumaEvent]:
+    """Keep events whose title or description contains at least one keyword."""
+    if not keywords:
+        return events
+
+    lower_keywords = [k.lower() for k in keywords]
+    result: list[LumaEvent] = []
+    for event in events:
+        text = f"{event.title} {event.description}".lower()
+        if any(kw in text for kw in lower_keywords):
+            result.append(event)
+
+    return result
+

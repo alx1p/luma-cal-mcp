@@ -12,7 +12,7 @@ from fastmcp import FastMCP
 
 from luma_mcp.config import Config, load_config
 from luma_mcp.event_store import EventStore
-from luma_mcp.geo import filter_by_distance
+from luma_mcp.geo import filter_by_distance, filter_by_keywords
 from luma_mcp.geocode import geocode
 from luma_mcp.ics import build_ics
 from luma_mcp.luma_registry import LumaRegistry
@@ -304,6 +304,7 @@ async def set_preferences(
 async def search_events(
     city: Optional[str] = None,
     category: Optional[str] = None,
+    keywords: Optional[list[str]] = None,
     max_distance_miles: Optional[float] = None,
     after: Optional[str] = None,
     before: Optional[str] = None,
@@ -318,16 +319,18 @@ async def search_events(
 
     **Home mode** (no `city`): searches your preferred categories via Luma's
     Category API — deep, rich results filtered by your stored address/distance.
-    On first run with no preferences, returns a raw Discover feed of popular
-    events near you, then prompts to set up categories, address, and login.
+    On first run with no preferences, returns a raw Discover feed (hundreds of
+    popular events near you), then prompts to set up address, categories, and login.
 
     **Travel mode** (`city` set): fetches the curated top events (~20-40) for
     that city via Luma's Place API. No topic filtering — just the highlights.
 
     IMPORTANT for agents:
-    - `category` must be an exact slug: tech, ai, food, arts, climate, fitness,
-      wellness, crypto. Translate user intent yourself (e.g. "artificial
-      intelligence" -> "ai", "blockchain" -> "crypto").
+    - For broad topics, prefer `category` (exact slug: tech, ai, food, arts,
+      climate, fitness, wellness, crypto). Translate user intent yourself
+      (e.g. "artificial intelligence" -> "ai", "blockchain" -> "crypto").
+    - Use `keywords` for specific terms that don't map to a category
+      (e.g. ["YC", "demo day"]) or to narrow within a category.
     - `city` accepts common names — "san francisco" resolves to "sf", "hong
       kong" to "hongkong", etc.
     - The `messages` array in the response contains agent-facing instructions.
@@ -337,6 +340,7 @@ async def search_events(
     Args:
         city: Luma city for travel mode (e.g. "sf", "london", "los angeles").
         category: One-off category override for home mode. Must be an exact slug.
+        keywords: Filter by keywords (matches title/description). Use for specific terms.
         max_distance_miles: One-off distance override for home mode.
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
@@ -500,6 +504,9 @@ async def search_events(
     if before_dt:
         events = [e for e in events if e.start_at <= before_dt]
 
+    if keywords:
+        events = filter_by_keywords(events, keywords)
+
     if latin_only:
         events = [e for e in events if _is_latin_event(e)]
 
@@ -540,7 +547,15 @@ async def search_events(
         cats_declined = bool(_stored_default(store, "categories_declined"))
         addr_declined = bool(_stored_default(store, "address_declined"))
 
-        if not has_categories and not cats_declined and not category:
+        if not has_address and not addr_declined:
+            messages.append(
+                "[agent] No home address set for distance filtering. Ask the user "
+                "for their address and preferred radius, then call "
+                "set_preferences(address=\"...\", max_distance_miles=N).\n\n"
+                "If the user says 'not now', do nothing.\n"
+                "If the user says 'never', call set_preferences(skip_address=true)."
+            )
+        elif not has_categories and not cats_declined and not category:
             cat_list = ", ".join(await registry.category_slugs())
             messages.append(
                 "[agent] No default categories set. Ask the user which topics "
@@ -548,14 +563,6 @@ async def search_events(
                 f"set_preferences(categories=[...]). Available: {cat_list}\n\n"
                 "If the user says 'not now', do nothing (will ask again next time).\n"
                 "If the user says 'never', call set_preferences(skip_categories=true)."
-            )
-        elif not has_address and not addr_declined:
-            messages.append(
-                "[agent] No home address set for distance filtering. Ask the user "
-                "for their address and preferred radius, then call "
-                "set_preferences(address=\"...\", max_distance_miles=N).\n\n"
-                "If the user says 'not now', do nothing.\n"
-                "If the user says 'never', call set_preferences(skip_address=true)."
             )
         elif not session_cookie and not _login_prompted:
             declined_row = store.get_setting("luma_login_declined_until")
@@ -752,7 +759,9 @@ def _event_summary(event: LumaEvent) -> dict:
     if "online" in addr_lower or "online" in label_lower:
         location = "Online"
     elif venue and city:
-        location = f"{venue}, {city}"
+        max_venue = _MAX_LOCATION_LEN - len(city) - 2  # room for ", City"
+        truncated_venue = _esc(venue, max(max_venue, 10))
+        location = f"{truncated_venue}, {city}"
     else:
         location = venue or city
 
@@ -762,7 +771,7 @@ def _event_summary(event: LumaEvent) -> dict:
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
-        "location": _esc(location, _MAX_LOCATION_LEN) if location else None,
+        "location": _esc(location) if location else None,
         "url": event.canonical_url,
     }
     if event.distance_miles is not None:
