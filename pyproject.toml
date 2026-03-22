@@ -11,6 +11,9 @@ dependencies = [
     "geopy",
 ]
 
+[project.optional-dependencies]
+auth = ["playwright"]
+
 [project.scripts]
 luma-mcp = "luma_mcp.server:main"
 

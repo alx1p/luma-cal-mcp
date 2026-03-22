@@ -9,8 +9,6 @@ from dotenv import load_dotenv
 
 @dataclass(frozen=True)
 class Config:
-    luma_web_session: str | None = None
-
     default_city: str | None = None
     default_category: str | None = None
     default_center_lat: float | None = None
@@ -23,10 +21,6 @@ class Config:
     geocoding_api_key: str | None = None
 
     event_store_path: str | None = None
-
-    @property
-    def web_session_configured(self) -> bool:
-        return bool(self.luma_web_session)
 
 
 def load_config() -> Config:
@@ -42,7 +36,6 @@ def load_config() -> Config:
     lon = os.getenv("DEFAULT_CENTER_LON")
 
     return Config(
-        luma_web_session=os.getenv("LUMA_WEB_SESSION") or None,
         default_city=os.getenv("DEFAULT_CITY") or None,
         default_category=os.getenv("DEFAULT_CATEGORY") or None,
         default_center_lat=float(lat) if lat else None,

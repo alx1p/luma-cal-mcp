@@ -1,4 +1,4 @@
-"""Local SQLite store that tracks when events were first seen."""
+"""Local SQLite store for event tracking and session/settings persistence."""
 
 from __future__ import annotations
 
@@ -23,6 +23,13 @@ class EventStore:
                 event_id    TEXT,
                 title       TEXT,
                 first_seen  TEXT NOT NULL
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS settings (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL,
+                updated TEXT NOT NULL
             )"""
         )
         self._conn.commit()
@@ -64,6 +71,32 @@ class EventStore:
             urls,
         ).fetchall()
         return {row[0]: datetime.fromisoformat(row[1]) for row in rows}
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
+
+    def set_setting(self, key: str, value: str) -> None:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT INTO settings (key, value, updated) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated = excluded.updated",
+            (key, value, now),
+        )
+        self._conn.commit()
+
+    def get_setting(self, key: str) -> Optional[tuple[str, datetime]]:
+        """Return (value, updated) or None."""
+        row = self._conn.execute(
+            "SELECT value, updated FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row:
+            return row[0], datetime.fromisoformat(row[1])
+        return None
+
+    def delete_setting(self, key: str) -> None:
+        self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()

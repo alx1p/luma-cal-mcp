@@ -20,7 +20,11 @@ mcp = FastMCP(name="Luma Events")
 
 _config: Optional[Config] = None
 _web_client: Optional[LumaWebClient] = None
+_web_client_cookie: Optional[str] = None
 _event_store: Optional[EventStore] = None
+
+_VALIDATION_MAX_AGE = timedelta(hours=24)
+_NEVER_TIMESTAMP = "9999-12-31T23:59:59+00:00"
 
 
 def _get_config() -> Config:
@@ -28,13 +32,6 @@ def _get_config() -> Config:
     if _config is None:
         _config = load_config()
     return _config
-
-
-def _get_web_client() -> LumaWebClient:
-    global _web_client
-    if _web_client is None:
-        _web_client = LumaWebClient(_get_config().luma_web_session)
-    return _web_client
 
 
 def _get_event_store() -> EventStore:
@@ -46,9 +43,138 @@ def _get_event_store() -> EventStore:
     return _event_store
 
 
+def _get_web_client(session_cookie: Optional[str] = None) -> LumaWebClient:
+    """Return a LumaWebClient, recreating it if the cookie changed."""
+    global _web_client, _web_client_cookie
+    if _web_client is None or session_cookie != _web_client_cookie:
+        _web_client_cookie = session_cookie
+        _web_client = LumaWebClient(session_cookie)
+    return _web_client
+
+
+def _get_stored_cookie(store: EventStore) -> Optional[str]:
+    row = store.get_setting("luma_session")
+    return row[0] if row else None
+
+
 def _geocode_fn(address: str) -> tuple[Optional[float], Optional[float]]:
     cfg = _get_config()
     return geocode(address, provider=cfg.geocoding_provider, api_key=cfg.geocoding_api_key)
+
+
+# --------------------------------------------------------------------------
+# Session management helpers
+# --------------------------------------------------------------------------
+
+async def _resolve_session(
+    store: EventStore,
+    messages: list[str],
+    *,
+    no_login: bool,
+    login: bool,
+    skip_login_days: Optional[int],
+) -> Optional[str]:
+    """Determine the session cookie to use for subscribed calendars.
+
+    Returns the cookie value if available, or None to skip subscribed calendars.
+    May add user-facing prompts to ``messages``.
+    """
+    if no_login:
+        return None
+
+    # Handle explicit skip_login_days from a prior prompt answer
+    if skip_login_days is not None:
+        if skip_login_days < 0:
+            store.set_setting("luma_login_declined_until", _NEVER_TIMESTAMP)
+        elif skip_login_days == 0:
+            store.delete_setting("luma_login_declined_until")
+        else:
+            until = datetime.now(tz=timezone.utc) + timedelta(days=skip_login_days)
+            store.set_setting("luma_login_declined_until", until.isoformat())
+        return None
+
+    # Handle explicit login=true from a prior prompt answer
+    if login:
+        cookie = _do_browser_login(store, messages)
+        return cookie
+
+    # Check if user previously declined and window is still active
+    declined_row = store.get_setting("luma_login_declined_until")
+    if declined_row:
+        declined_until = datetime.fromisoformat(declined_row[0])
+        if datetime.now(tz=timezone.utc) < declined_until:
+            return None
+        # Window expired — clear it so we re-prompt
+        store.delete_setting("luma_login_declined_until")
+
+    # Try existing cookie
+    cookie = _get_stored_cookie(store)
+    if cookie:
+        valid = await _validate_if_stale(store, cookie, messages)
+        if valid:
+            return cookie
+        # Cookie expired — clear it
+        store.delete_setting("luma_session")
+        store.delete_setting("luma_session_validated")
+
+    # No valid cookie — check if user ever logged in before
+    had_cookie_row = store.get_setting("luma_login_had_cookie")
+    if had_cookie_row and had_cookie_row[0] == "true":
+        # Returning user with expired cookie — auto-relogin
+        messages.append(
+            "Your Luma session expired. Opening browser to re-authenticate..."
+        )
+        cookie = _do_browser_login(store, messages)
+        return cookie
+
+    # First time ever, or previously declined and window expired — prompt
+    messages.append(
+        "Would you like to log in to Luma to also see events from your "
+        "subscribed calendars? (Y/n)\n\n"
+        "Call search_events with login=true to log in, or "
+        "skip_login_days=N to decline (0 = ask next time, -1 = never ask again)."
+    )
+    return None
+
+
+async def _validate_if_stale(
+    store: EventStore,
+    cookie: str,
+    messages: list[str],
+) -> bool:
+    """Validate stored cookie if last validation is older than 24h. Returns True if valid."""
+    validated_row = store.get_setting("luma_session_validated")
+    if validated_row:
+        validated_at = validated_row[1]
+        if datetime.now(tz=timezone.utc) - validated_at < _VALIDATION_MAX_AGE:
+            return True
+
+    from luma_mcp.auth import validate_session
+    valid = await validate_session(cookie)
+    if valid:
+        store.set_setting("luma_session_validated", datetime.now(tz=timezone.utc).isoformat())
+        return True
+    return False
+
+
+def _do_browser_login(store: EventStore, messages: list[str]) -> Optional[str]:
+    """Launch browser login, persist cookie on success."""
+    try:
+        from luma_mcp.auth import browser_login
+        cookie = browser_login()
+        store.set_setting("luma_session", cookie)
+        store.set_setting("luma_session_validated", datetime.now(tz=timezone.utc).isoformat())
+        store.set_setting("luma_login_had_cookie", "true")
+        global _web_client, _web_client_cookie
+        _web_client = None
+        _web_client_cookie = None
+        return cookie
+    except ImportError as e:
+        messages.append(str(e))
+        return None
+    except TimeoutError as e:
+        messages.append(str(e))
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -71,6 +197,9 @@ async def search_events(
     exclude_unknown_location: bool = False,
     added_within_days: Optional[float] = None,
     new_only: bool = False,
+    login: bool = False,
+    skip_login_days: Optional[int] = None,
+    no_login: bool = False,
 ) -> dict:
     """Search for Luma events from Discover and/or subscribed calendars.
 
@@ -91,6 +220,9 @@ async def search_events(
         exclude_unknown_location: If true, drop events that have no coordinates.
         added_within_days: Only return events first seen within this many days (e.g. 5). Requires prior runs to populate the store.
         new_only: If true, only return events that have never been seen before (first appearance this run).
+        login: Set to true to open a browser and log in to Luma for subscribed calendar access.
+        skip_login_days: Decline Luma login for N days. 0 = ask next time, -1 = never ask again.
+        no_login: If true, skip subscribed calendars for this call without changing stored preferences.
     """
     cfg = _get_config()
     city = city or cfg.default_city
@@ -112,9 +244,20 @@ async def search_events(
     event_lists: list[list[LumaEvent]] = []
     messages: list[str] = []
 
+    store = _get_event_store()
+
+    # Resolve session cookie for subscribed calendars
+    session_cookie: Optional[str] = None
+    want_subscribed = source in ("all", "subscribed")
+    if want_subscribed:
+        session_cookie = await _resolve_session(
+            store, messages,
+            no_login=no_login, login=login, skip_login_days=skip_login_days,
+        )
+
     if source in ("all", "discover"):
         try:
-            web = _get_web_client()
+            web = _get_web_client(session_cookie)
             discover = await web.discover_events(
                 geo_region_slug=city,
                 category=category,
@@ -125,18 +268,13 @@ async def search_events(
         except Exception as e:
             messages.append(f"Discover source error: {e}")
 
-    if source in ("all", "subscribed"):
-        if cfg.web_session_configured:
-            try:
-                web = _get_web_client()
-                subscribed = await web.subscribed_calendar_events()
-                event_lists.append(subscribed)
-            except Exception as e:
-                messages.append(f"Subscribed calendars error: {e}")
-        else:
-            messages.append(
-                "Subscribed calendars unavailable — set LUMA_WEB_SESSION in env to enable."
-            )
+    if want_subscribed and session_cookie:
+        try:
+            web = _get_web_client(session_cookie)
+            subscribed = await web.subscribed_calendar_events()
+            event_lists.append(subscribed)
+        except Exception as e:
+            messages.append(f"Subscribed calendars error: {e}")
 
     events = merge_events(event_lists)
 
@@ -161,7 +299,6 @@ async def search_events(
 
     summaries = [_event_summary(e) for e in events]
 
-    store = _get_event_store()
     new_urls = set(store.record(summaries))
     seen_times = store.first_seen_batch([s["url"] for s in summaries])
 
