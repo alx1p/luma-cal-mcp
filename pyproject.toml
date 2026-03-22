@@ -1,0 +1,26 @@
+[project]
+name = "luma-mcp"
+version = "0.1.0"
+description = "FastMCP server for Luma event discovery, filtering, and calendar export"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp",
+    "httpx",
+    "pydantic",
+    "python-dotenv",
+    "geopy",
+]
+
+[project.scripts]
+luma-mcp = "luma_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/luma_mcp"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
