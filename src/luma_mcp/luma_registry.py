@@ -21,6 +21,8 @@ _CACHE_TTL = timedelta(days=7)
 _SETTINGS_KEY_PLACES = "registry_places"
 _SETTINGS_KEY_CATEGORIES = "registry_categories"
 _SETTINGS_KEY_CONTINENTS = "registry_continents"
+_SETTINGS_KEY_PLACE_NAMES = "registry_place_names"
+_SETTINGS_KEY_CATEGORY_NAMES = "registry_category_names"
 
 PlaceInfo = tuple[str, float, float]  # (discover_place_api_id, lat, lon)
 
@@ -146,15 +148,76 @@ _FALLBACK_CONTINENTS: dict[str, str] = {
     **{s: "africa" for s in ["lagos", "capetown", "nairobi"]},
 }
 
+_FALLBACK_PLACE_NAMES: dict[str, str] = {
+    "sf": "San Francisco", "la": "Los Angeles", "las-vegas": "Las Vegas",
+    "sd": "San Diego", "portland": "Portland", "salt-lake-city": "Salt Lake City",
+    "phoenix": "Phoenix", "seattle": "Seattle", "vancouver": "Vancouver",
+    "denver": "Denver", "calgary": "Calgary", "dallas": "Dallas",
+    "austin": "Austin", "minneapolis": "Minneapolis", "houston": "Houston",
+    "chicago": "Chicago", "mexico-city": "Mexico City", "atlanta": "Atlanta",
+    "waterloo_ca": "Waterloo", "toronto": "Toronto", "honolulu": "Honolulu",
+    "dc": "Washington DC", "philadelphia": "Philadelphia", "montreal": "Montreal",
+    "nyc": "New York City", "miami": "Miami", "boston": "Boston",
+    "medellin": "Medellín", "bogota": "Bogotá", "buenos-aires": "Buenos Aires",
+    "saopaulo": "São Paulo", "rio": "Rio de Janeiro",
+    "dublin": "Dublin", "london": "London", "stockholm": "Stockholm",
+    "helsinki": "Helsinki", "amsterdam": "Amsterdam", "copenhagen": "Copenhagen",
+    "brussels": "Brussels", "hamburg": "Hamburg", "paris": "Paris",
+    "berlin": "Berlin", "lisbon": "Lisbon", "madrid": "Madrid",
+    "lausanne": "Lausanne", "geneva": "Geneva", "zurich": "Zurich",
+    "prague": "Prague", "warsaw": "Warsaw", "munich": "Munich",
+    "barcelona": "Barcelona", "milan": "Milan", "vienna": "Vienna",
+    "budapest": "Budapest", "rome": "Rome", "istanbul": "Istanbul",
+    "tokyo": "Tokyo", "seoul": "Seoul", "taipei": "Taipei",
+    "hongkong": "Hong Kong", "manila": "Manila",
+    "ho-chi-minh-city": "Ho Chi Minh City", "bangkok": "Bangkok",
+    "kuala-lumpur": "Kuala Lumpur", "singapore": "Singapore",
+    "jakarta": "Jakarta", "bengaluru": "Bengaluru", "new-delhi": "New Delhi",
+    "mumbai": "Mumbai", "dubai": "Dubai", "tel-aviv": "Tel Aviv",
+    "auckland": "Auckland", "brisbane": "Brisbane", "sydney": "Sydney",
+    "melbourne": "Melbourne", "lagos": "Lagos", "nairobi": "Nairobi",
+    "capetown": "Cape Town",
+}
+
+_FALLBACK_CATEGORY_NAMES: dict[str, str] = {
+    "tech": "Tech", "food": "Food & Drink", "ai": "AI",
+    "arts": "Arts & Culture", "climate": "Climate", "fitness": "Fitness",
+    "wellness": "Wellness", "crypto": "Crypto",
+}
+
+_CATEGORY_ALIASES: dict[str, str] = {
+    "artificial intelligence": "ai", "machine learning": "ai", "aiml": "ai",
+    "ml": "ai", "deep learning": "ai", "gen ai": "ai", "genai": "ai",
+    "technology": "tech", "software": "tech", "engineering": "tech",
+    "web3": "crypto", "blockchain": "crypto", "defi": "crypto",
+    "bitcoin": "crypto", "ethereum": "crypto",
+    "food and drink": "food", "food & drink": "food",
+    "dining": "food", "restaurant": "food", "restaurants": "food",
+    "art": "arts", "culture": "arts", "arts and culture": "arts",
+    "music": "arts", "theater": "arts", "theatre": "arts",
+    "health": "wellness", "meditation": "wellness", "mindfulness": "wellness",
+    "yoga": "fitness", "exercise": "fitness", "gym": "fitness",
+    "sports": "fitness", "running": "fitness", "workout": "fitness",
+    "sustainability": "climate", "environment": "climate", "green": "climate",
+    "cleantech": "climate", "clean energy": "climate",
+}
+
 
 # ------------------------------------------------------------------
 # Fetch from lu.ma/discover
 # ------------------------------------------------------------------
 
-def _parse_discover_page(
-    html: str,
-) -> tuple[dict[str, PlaceInfo], dict[str, str], dict[str, str]]:
-    """Extract places, categories, and continent mappings from __NEXT_DATA__."""
+_DiscoverData = tuple[
+    dict[str, PlaceInfo],   # places
+    dict[str, str],         # categories (slug → api_id)
+    dict[str, str],         # continents (slug → continent code)
+    dict[str, str],         # place_names (slug → display name)
+    dict[str, str],         # category_names (slug → display name)
+]
+
+
+def _parse_discover_page(html: str) -> _DiscoverData:
+    """Extract places, categories, continents, and display names from __NEXT_DATA__."""
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html)
     if not match:
         raise ValueError("__NEXT_DATA__ not found")
@@ -163,23 +226,31 @@ def _parse_discover_page(
     initial = data["props"]["pageProps"]["initialData"]
 
     places: dict[str, PlaceInfo] = {}
+    place_names: dict[str, str] = {}
     for p in initial.get("places", []):
         place = p["place"]
         slug = place.get("slug")
         api_id = place.get("api_id")
+        name = place.get("name")
         coord = place.get("coordinate", {})
         lat = coord.get("latitude")
         lon = coord.get("longitude")
         if slug and api_id and lat is not None and lon is not None:
             places[slug] = (api_id, float(lat), float(lon))
+            if name:
+                place_names[slug] = name
 
     categories: dict[str, str] = {}
+    category_names: dict[str, str] = {}
     for c in initial.get("categories", []):
         cat = c["category"]
         slug = cat.get("slug")
         api_id = cat.get("api_id")
+        name = cat.get("name")
         if slug and api_id:
             categories[slug] = api_id
+            if name:
+                category_names[slug] = name
 
     continents: dict[str, str] = {}
     for group in initial.get("places_by_continent", []):
@@ -192,7 +263,7 @@ def _parse_discover_page(
     if not places or not categories:
         raise ValueError(f"Incomplete data: {len(places)} places, {len(categories)} categories")
 
-    return places, categories, continents
+    return places, categories, continents, place_names, category_names
 
 
 async def _fetch_discover_html() -> str:
@@ -234,51 +305,90 @@ def _deserialize_categories(raw: str) -> dict[str, str]:
 class MatchResult:
     exact: bool
     slug: Optional[str]
-    candidates: list[str]
+    candidates: list[str]  # formatted as "slug (Display Name)"
 
 
 def _normalize(s: str) -> str:
-    """Lowercase, strip whitespace, replace spaces/underscores with hyphens."""
-    return re.sub(r"[\s_]+", "-", s.strip().lower())
+    """Lowercase, strip, remove dots/commas, collapse whitespace/underscores to hyphens."""
+    s = s.strip().lower()
+    s = s.replace(".", "").replace(",", "")
+    return re.sub(r"[\s_]+", "-", s)
 
 
-def _fuzzy_match(input_str: str, slugs: list[str]) -> MatchResult:
+def _fmt(slug: str, names: dict[str, str]) -> str:
+    """Format a slug with its display name for user-facing messages."""
+    name = names.get(slug)
+    return f"{slug} ({name})" if name else slug
+
+
+def _fuzzy_match(
+    input_str: str,
+    slugs: list[str],
+    display_names: Optional[dict[str, str]] = None,
+    aliases: Optional[dict[str, str]] = None,
+) -> MatchResult:
     """Match a user string to the closest known slug.
 
-    Returns exact=True when the input matches a slug directly (after
-    normalization).  Otherwise returns up to 5 candidates ranked by
-    substring containment and edit distance.
+    Matches against slugs, display names, and aliases (if provided).
+    Returns exact=True when the input matches unambiguously.
+    Otherwise returns up to 5 candidates with display names.
     """
+    names = display_names or {}
     norm = _normalize(input_str)
 
-    # Exact match (after normalization)
     if norm in slugs:
         return MatchResult(exact=True, slug=norm, candidates=[])
 
-    # Substring matches (input contained in slug or slug contained in input)
-    substring_hits = [s for s in slugs if norm in s or s in norm]
-    if len(substring_hits) == 1:
-        return MatchResult(exact=False, slug=substring_hits[0], candidates=substring_hits)
+    # Build a reverse lookup: normalized display name / alias → slug
+    name_to_slug: dict[str, str] = {}
+    for slug in slugs:
+        name = names.get(slug)
+        if name:
+            name_to_slug[_normalize(name)] = slug
+    if aliases:
+        for alias, slug in aliases.items():
+            if slug in slugs:
+                name_to_slug[_normalize(alias)] = slug
 
-    # Edit-distance ranking for remaining candidates
+    if norm in name_to_slug:
+        return MatchResult(exact=True, slug=name_to_slug[norm], candidates=[])
+
+    # Substring matches against both slugs and normalized display names
+    substring_hits: list[str] = []
+    seen: set[str] = set()
+    for s in slugs:
+        norm_name = _normalize(names[s]) if s in names else ""
+        if norm in s or s in norm or (norm_name and (norm in norm_name or norm_name in norm)):
+            if s not in seen:
+                substring_hits.append(s)
+                seen.add(s)
+
+    if len(substring_hits) == 1:
+        return MatchResult(exact=True, slug=substring_hits[0], candidates=[])
+
+    # Edit-distance ranking against both slug and display name (take best)
     scored: list[tuple[int, str]] = []
     for s in slugs:
-        d = _edit_distance(norm, s)
-        scored.append((d, s))
+        d_slug = _edit_distance(norm, s)
+        d_name = _edit_distance(norm, _normalize(names[s])) if s in names else d_slug
+        scored.append((min(d_slug, d_name), s))
     scored.sort()
 
-    # Combine substring hits (prioritized) with edit-distance results
-    seen = set(substring_hits)
     combined = list(substring_hits)
+    combined_set = set(substring_hits)
     for _d, s in scored:
-        if s not in seen:
+        if s not in combined_set:
             combined.append(s)
-            seen.add(s)
+            combined_set.add(s)
         if len(combined) >= 5:
             break
 
     best = combined[0] if combined else None
-    return MatchResult(exact=False, slug=best, candidates=combined[:5])
+    return MatchResult(
+        exact=False,
+        slug=best,
+        candidates=[_fmt(s, names) for s in combined[:5]],
+    )
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -309,6 +419,8 @@ class LumaRegistry:
         self._places: Optional[dict[str, PlaceInfo]] = None
         self._categories: Optional[dict[str, str]] = None
         self._continents: Optional[dict[str, str]] = None
+        self._place_names: Optional[dict[str, str]] = None
+        self._category_names: Optional[dict[str, str]] = None
 
     def _load_cache(self) -> bool:
         """Try loading from SQLite cache. Returns True if cache is fresh."""
@@ -334,6 +446,20 @@ class LumaRegistry:
             except json.JSONDecodeError:
                 pass
 
+        pn_row = self._store.get_setting(_SETTINGS_KEY_PLACE_NAMES)
+        if pn_row:
+            try:
+                self._place_names = json.loads(pn_row[0])
+            except json.JSONDecodeError:
+                pass
+
+        cn_row = self._store.get_setting(_SETTINGS_KEY_CATEGORY_NAMES)
+        if cn_row:
+            try:
+                self._category_names = json.loads(cn_row[0])
+            except json.JSONDecodeError:
+                pass
+
         oldest = min(p_updated, c_updated)
         return (now - oldest) < _CACHE_TTL
 
@@ -342,19 +468,25 @@ class LumaRegistry:
         places: dict[str, PlaceInfo],
         categories: dict[str, str],
         continents: dict[str, str],
+        place_names: dict[str, str],
+        category_names: dict[str, str],
     ) -> None:
         self._store.set_setting(_SETTINGS_KEY_PLACES, _serialize_places(places))
         self._store.set_setting(_SETTINGS_KEY_CATEGORIES, _serialize_categories(categories))
         self._store.set_setting(_SETTINGS_KEY_CONTINENTS, json.dumps(continents))
+        self._store.set_setting(_SETTINGS_KEY_PLACE_NAMES, json.dumps(place_names))
+        self._store.set_setting(_SETTINGS_KEY_CATEGORY_NAMES, json.dumps(category_names))
 
     async def refresh(self) -> None:
         """Fetch fresh data from Luma and update the cache."""
         html = await _fetch_discover_html()
-        places, categories, continents = _parse_discover_page(html)
+        places, categories, continents, place_names, category_names = _parse_discover_page(html)
         self._places = places
         self._categories = categories
         self._continents = continents
-        self._save_cache(places, categories, continents)
+        self._place_names = place_names
+        self._category_names = category_names
+        self._save_cache(places, categories, continents, place_names, category_names)
 
     async def get_places(self) -> dict[str, PlaceInfo]:
         if self._places is None:
@@ -400,6 +532,16 @@ class LumaRegistry:
             await self.get_places()  # triggers _load_cache / refresh
         return self._continents or _FALLBACK_CONTINENTS
 
+    async def get_place_names(self) -> dict[str, str]:
+        if self._place_names is None:
+            await self.get_places()
+        return self._place_names or _FALLBACK_PLACE_NAMES
+
+    async def get_category_names(self) -> dict[str, str]:
+        if self._category_names is None:
+            await self.get_categories()
+        return self._category_names or _FALLBACK_CATEGORY_NAMES
+
     async def continent_of(self, city_slug: str) -> Optional[str]:
         """Return the continent code for a city slug (na, apac, sa, europe, africa)."""
         continents = await self.get_continents()
@@ -408,9 +550,11 @@ class LumaRegistry:
     async def match_city(self, input_str: str) -> MatchResult:
         """Fuzzy-match a user-supplied city string to a known Luma slug."""
         places = await self.get_places()
-        return _fuzzy_match(input_str, list(places.keys()))
+        names = await self.get_place_names()
+        return _fuzzy_match(input_str, list(places.keys()), names)
 
     async def match_category(self, input_str: str) -> MatchResult:
         """Fuzzy-match a user-supplied category string to a known Luma slug."""
         cats = await self.get_categories()
-        return _fuzzy_match(input_str, list(cats.keys()))
+        names = await self.get_category_names()
+        return _fuzzy_match(input_str, list(cats.keys()), names, _CATEGORY_ALIASES)

@@ -121,12 +121,11 @@ async def _resolve_defaults(
     eff_city = city or stored_city
     eff_category = category or stored_category
 
-    # When city is explicitly overridden to a different region, the stored
-    # address/distance (tied to the default city) don't apply.
-    city_overridden = city and stored_city and city != stored_city
-    eff_address = center_address or (None if city_overridden else stored_address)
+    # When city is explicitly passed, the stored address/distance (tied to
+    # the user's home location) don't apply — use city-center filtering instead.
+    eff_address = center_address or (None if city else stored_address)
     eff_distance = max_distance_miles or (
-        None if city_overridden
+        None if city
         else (float(stored_distance) if stored_distance else None)
     )
 
@@ -322,18 +321,22 @@ async def set_preferences(
         if match.exact:
             store.set_setting("default_city", match.slug)
             saved["city"] = match.slug
-        elif match.slug:
+        elif match.candidates:
             messages.append(
-                f"[agent] \"{city}\" is not an exact Luma city. "
-                f"Did the user mean \"{match.slug}\"? "
-                f"Confirm with the user, then call set_preferences(city=\"{match.slug}\").\n"
-                f"Other options: {', '.join(match.candidates)}"
+                f"[agent] \"{city}\" is not an exact Luma city slug. "
+                f"Closest: {', '.join(match.candidates)}. "
+                f"Pick the best match and call set_preferences(city=\"<slug>\"), "
+                f"or clarify with the user if ambiguous."
             )
         else:
-            all_cities = ", ".join(await registry.city_slugs())
+            place_names = await registry.get_place_names()
+            all_cities = ", ".join(
+                f"{s} ({place_names[s]})" if s in place_names else s
+                for s in await registry.city_slugs()
+            )
             messages.append(
                 f"[agent] \"{city}\" doesn't match any Luma city. "
-                f"Ask the user to pick from: {all_cities}"
+                f"Available: {all_cities}"
             )
 
     # Validate & resolve category
@@ -342,18 +345,22 @@ async def set_preferences(
         if match.exact:
             store.set_setting("default_category", match.slug)
             saved["category"] = match.slug
-        elif match.slug:
+        elif match.candidates:
             messages.append(
-                f"[agent] \"{category}\" is not an exact Luma category. "
-                f"Did the user mean \"{match.slug}\"? "
-                f"Confirm with the user, then call set_preferences(category=\"{match.slug}\").\n"
-                f"Other options: {', '.join(match.candidates)}"
+                f"[agent] \"{category}\" is not an exact Luma category slug. "
+                f"Closest: {', '.join(match.candidates)}. "
+                f"Pick the best match and call set_preferences(category=\"<slug>\"), "
+                f"or clarify with the user if ambiguous."
             )
         else:
-            all_cats = ", ".join(await registry.category_slugs())
+            cat_names = await registry.get_category_names()
+            all_cats = ", ".join(
+                f"{s} ({cat_names[s]})" if s in cat_names else s
+                for s in await registry.category_slugs()
+            )
             messages.append(
                 f"[agent] \"{category}\" doesn't match any Luma category. "
-                f"Ask the user to pick from: {all_cats}"
+                f"Available: {all_cats}"
             )
 
     if address is not None:
@@ -462,33 +469,55 @@ async def search_events(
     if not city and resolved_lat is not None and resolved_lon is not None:
         city = await _nearest_city(resolved_lat, resolved_lon)
 
-    # Resolve slugs → Luma API IDs (with fuzzy matching)
+    # Resolve slugs → Luma API IDs (exact match required)
     registry = _get_registry()
     place_api_id: Optional[str] = None
     if city:
         place_api_id = await registry.resolve_place(city)
         if place_api_id is None:
             match = await registry.match_city(city)
-            if match.slug:
-                place_api_id = await registry.resolve_place(match.slug)
+            if match.exact and match.slug:
                 city = match.slug
+                place_api_id = await registry.resolve_place(city)
+            else:
+                if match.candidates:
+                    options = ", ".join(match.candidates)
+                else:
+                    place_names = await registry.get_place_names()
+                    options = ", ".join(
+                        f"{s} ({place_names[s]})" if s in place_names else s
+                        for s in await registry.city_slugs()
+                    )
                 messages.append(
-                    f"[agent] Interpreted city \"{city}\" as \"{match.slug}\". "
-                    "If that's wrong, the user can correct it."
+                    f"[agent] \"{city}\" is not a known Luma city slug. "
+                    f"Pick the best match and rerun, or clarify with the user if ambiguous.\n"
+                    f"Closest: {options}"
                 )
+                return {"events": [], "count": 0, "messages": messages}
 
     category_api_id: Optional[str] = None
     if category:
         category_api_id = await registry.resolve_category(category)
         if category_api_id is None:
             match = await registry.match_category(category)
-            if match.slug:
-                category_api_id = await registry.resolve_category(match.slug)
+            if match.exact and match.slug:
                 category = match.slug
+                category_api_id = await registry.resolve_category(category)
+            else:
+                if match.candidates:
+                    options = ", ".join(match.candidates)
+                else:
+                    cat_names = await registry.get_category_names()
+                    options = ", ".join(
+                        f"{s} ({cat_names[s]})" if s in cat_names else s
+                        for s in await registry.category_slugs()
+                    )
                 messages.append(
-                    f"[agent] Interpreted category \"{category}\" as \"{match.slug}\". "
-                    "If that's wrong, the user can correct it."
+                    f"[agent] \"{category}\" is not a known Luma category slug. "
+                    f"Pick the best match and rerun, or clarify with the user if ambiguous.\n"
+                    f"Available: {options}"
                 )
+                return {"events": [], "count": 0, "messages": messages}
 
     # Luma's API ignores category when place is also set, so when the user
     # asks for a category we drop the place filter and rely on our own
@@ -539,7 +568,7 @@ async def search_events(
             if info:
                 _pid, filter_lat, filter_lon = info
                 if filter_dist is None:
-                    filter_dist = 50.0
+                    filter_dist = 25.0
                 # Only exclude unknown-location events when searching a
                 # foreign city; in the user's home city they're likely local.
                 if city != home_city:
