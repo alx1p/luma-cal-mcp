@@ -23,8 +23,11 @@ def browser_login() -> str:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise ImportError(
-            "Playwright is required for browser login. Install it with:\n"
-            "  uv pip install 'luma-mcp[auth]' && playwright install chromium"
+            "Playwright is required for browser login. Run these in a normal "
+            "terminal (not Cursor's built-in terminal, which may sandbox the install):\n"
+            "  cd /path/to/Luma\\ Cal\\ MCP\n"
+            "  uv pip install -e '.[auth]'\n"
+            "  playwright install chromium"
         )
 
     with sync_playwright() as pw:
