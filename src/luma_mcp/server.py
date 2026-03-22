@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
 
 from luma_mcp.config import Config, load_config
+from luma_mcp.event_store import EventStore
 from luma_mcp.geo import filter_by_distance, filter_by_keywords, resolve_center
 from luma_mcp.geocode import geocode
 from luma_mcp.ics import build_ics
@@ -18,6 +20,7 @@ mcp = FastMCP(name="Luma Events")
 
 _config: Optional[Config] = None
 _web_client: Optional[LumaWebClient] = None
+_event_store: Optional[EventStore] = None
 
 
 def _get_config() -> Config:
@@ -32,6 +35,15 @@ def _get_web_client() -> LumaWebClient:
     if _web_client is None:
         _web_client = LumaWebClient(_get_config().luma_web_session)
     return _web_client
+
+
+def _get_event_store() -> EventStore:
+    global _event_store
+    if _event_store is None:
+        cfg = _get_config()
+        db_path = Path(cfg.event_store_path) if cfg.event_store_path else None
+        _event_store = EventStore(db_path=db_path)
+    return _event_store
 
 
 def _geocode_fn(address: str) -> tuple[Optional[float], Optional[float]]:
@@ -57,6 +69,8 @@ async def search_events(
     after: Optional[str] = None,
     before: Optional[str] = None,
     exclude_unknown_location: bool = False,
+    added_within_days: Optional[float] = None,
+    new_only: bool = False,
 ) -> dict:
     """Search for Luma events from Discover and/or subscribed calendars.
 
@@ -75,6 +89,8 @@ async def search_events(
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
         exclude_unknown_location: If true, drop events that have no coordinates.
+        added_within_days: Only return events first seen within this many days (e.g. 5). Requires prior runs to populate the store.
+        new_only: If true, only return events that have never been seen before (first appearance this run).
     """
     cfg = _get_config()
     city = city or cfg.default_city
@@ -143,9 +159,30 @@ async def search_events(
 
     events.sort(key=lambda e: e.start_at)
 
+    summaries = [_event_summary(e) for e in events]
+
+    store = _get_event_store()
+    new_urls = set(store.record(summaries))
+    seen_times = store.first_seen_batch([s["url"] for s in summaries])
+
+    for s in summaries:
+        fs = seen_times.get(s["url"])
+        s["first_seen_at"] = fs.isoformat() if fs else None
+        s["is_new"] = s["url"] in new_urls
+
+    if new_only:
+        summaries = [s for s in summaries if s["is_new"]]
+
+    if added_within_days is not None:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=added_within_days)
+        summaries = [
+            s for s in summaries
+            if s["first_seen_at"] and datetime.fromisoformat(s["first_seen_at"]) >= cutoff
+        ]
+
     return {
-        "events": [_event_summary(e) for e in events],
-        "count": len(events),
+        "events": summaries,
+        "count": len(summaries),
         "messages": messages or None,
     }
 

@@ -22,6 +22,8 @@ class Config:
     geocoding_provider: str = "nominatim"
     geocoding_api_key: str | None = None
 
+    event_store_path: str | None = None
+
     @property
     def web_session_configured(self) -> bool:
         return bool(self.luma_web_session)
@@ -50,6 +52,7 @@ def load_config() -> Config:
         default_keywords=keywords,
         geocoding_provider=os.getenv("GEOCODING_PROVIDER", "nominatim").lower(),
         geocoding_api_key=os.getenv("GEOCODING_API_KEY") or None,
+        event_store_path=os.getenv("EVENT_STORE_PATH") or None,
     )
 
 
