@@ -6,7 +6,7 @@ A [FastMCP](https://gofastmcp.com) server that discovers events from [Luma](http
 
 | Tool | What it does |
 |------|-------------|
-| `search_events` | Unified search across Discover and subscribed calendars. Filter by city/region, category, distance from a point (coordinates or address), and keywords. |
+| `search_events` | Unified search across Discover and subscribed calendars. Filter by city/region, category, distance from a point (coordinates or address), keywords, and recency (`added_within_days`, `new_only`). |
 | `get_event` | Fetch full details for a single event by API id or `lu.ma` URL. Includes RSVP link. |
 | `export_event_ics` | Generate an ICS string for any event — paste into Apple Calendar, Google Calendar, Outlook, etc. |
 
@@ -47,6 +47,7 @@ cp .env.example .env
 - `DEFAULT_KEYWORDS` — comma-separated keyword list.
 - `GEOCODING_PROVIDER` — `nominatim` (default, free), `google`, or `mapbox`.
 - `GEOCODING_API_KEY` — required for Google or Mapbox geocoding.
+- `EVENT_STORE_PATH` — path to the SQLite DB that tracks first-seen timestamps. Default: `~/.luma-mcp/events.db`.
 
 ### Run
 
@@ -57,6 +58,15 @@ fastmcp run src/luma_mcp/server.py
 # or directly
 python -m luma_mcp.server
 ```
+
+## New Event Tracking
+
+The server maintains a local SQLite database (`~/.luma-mcp/events.db` by default) that records the first time each event is seen. This enables two filters on `search_events`:
+
+- **`added_within_days`** — only return events first seen within the last N days (e.g. `added_within_days=5` for events discovered in the past week).
+- **`new_only`** — only return events that have never been seen before (first appearance this run).
+
+Every result also includes `first_seen_at` (ISO timestamp) and `is_new` (boolean). The store builds up over repeated runs, so after regular use you can reliably ask "what's new since last time."
 
 ## Cursor MCP Configuration
 
@@ -71,7 +81,10 @@ Add to your Cursor MCP settings (`.cursor/mcp.json`):
         "run",
         "--directory", "/path/to/Luma Cal MCP",
         "fastmcp", "run", "src/luma_mcp/server.py"
-      ]
+      ],
+      "env": {
+        "PYTHONPATH": "/path/to/Luma Cal MCP/src"
+      }
     }
   }
 }
