@@ -587,16 +587,28 @@ _STATE_ZIP_RE = re.compile(r"^[A-Z]{2}\s+\d{4,5}")
 
 
 def _extract_city(full_address: Optional[str]) -> Optional[str]:
-    """Pull the city name from a full address string like '123 Main St, Palo Alto, CA 94301'."""
+    """Pull the city name from a full address string.
+
+    Handles formats like:
+      '123 Main St, Palo Alto, CA 94301, USA' → 'Palo Alto'
+      'San Francisco, CA 94102' → 'San Francisco'
+      'San Francisco, CA' → 'San Francisco'
+      'Online' → None
+    """
     if not full_address:
         return None
     parts = [p.strip() for p in full_address.split(",")]
-    if len(parts) < 3:
-        return None
+    # Find the part just before a state+zip pattern
     for i in range(1, len(parts)):
         if _STATE_ZIP_RE.match(parts[i]):
             return parts[i - 1]
-    return parts[-2]
+    # "City, ST" pattern — first part is the city if second looks like a state
+    if len(parts) == 2 and len(parts[1].strip()) == 2 and parts[1].strip().isalpha():
+        return parts[0]
+    # 3+ parts without state+zip: second-to-last is likely the city
+    if len(parts) >= 3:
+        return parts[-2]
+    return None
 
 
 def _venue_name(label: Optional[str]) -> Optional[str]:
@@ -611,8 +623,12 @@ def _venue_name(label: Optional[str]) -> Optional[str]:
 
 def _event_summary(event: LumaEvent) -> dict:
     venue = _venue_name(event.location_label)
-    city = _extract_city(event.full_address)
-    if venue and city:
+    city = _extract_city(event.full_address) or _extract_city(event.location_label)
+    addr_lower = (event.full_address or "").lower()
+    label_lower = (event.location_label or "").lower()
+    if "online" in addr_lower or "online" in label_lower:
+        location = "Online"
+    elif venue and city:
         location = f"{venue}, {city}"
     else:
         location = venue or city
