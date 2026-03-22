@@ -305,6 +305,7 @@ async def search_events(
     city: Optional[str] = None,
     category: Optional[str] = None,
     keywords: Optional[list[str]] = None,
+    center_address: Optional[str] = None,
     max_distance_miles: Optional[float] = None,
     after: Optional[str] = None,
     before: Optional[str] = None,
@@ -346,7 +347,8 @@ async def search_events(
         city: Luma city for travel mode (e.g. "sf", "london", "los angeles").
         category: One-off category override for home mode. Must be an exact slug.
         keywords: Filter by keywords (matches title/description). Use for specific terms.
-        max_distance_miles: One-off distance override for home mode.
+        center_address: One-off address to filter around (e.g. "Union Square, San Francisco"). Overrides stored address for this search only.
+        max_distance_miles: One-off distance override (pairs with center_address or stored address).
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
         days: Search window in days from now (e.g. 7, 30). Overrides the default 14-day window. Simpler alternative to after/before.
@@ -493,9 +495,10 @@ async def search_events(
 
         events = _backfill_known_coords(merge_events(event_lists))
 
-        # Distance filter from stored address
-        if stored_address and eff_dist:
-            resolved_lat, resolved_lon = _geocode_fn(stored_address)
+        # Distance filter: one-off center_address overrides stored address
+        filter_address = center_address or stored_address
+        if filter_address and eff_dist:
+            resolved_lat, resolved_lon = _geocode_fn(filter_address)
             if resolved_lat is not None and resolved_lon is not None:
                 events = filter_by_distance(
                     events, resolved_lat, resolved_lon, eff_dist,
