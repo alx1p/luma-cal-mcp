@@ -558,3 +558,17 @@ class LumaRegistry:
         cats = await self.get_categories()
         names = await self.get_category_names()
         return _fuzzy_match(input_str, list(cats.keys()), names, _CATEGORY_ALIASES)
+
+    async def category_keywords(self, category_slug: str) -> list[str]:
+        """Return keyword terms for client-side filtering of a category.
+
+        Includes the slug itself, the display name, and all known aliases.
+        """
+        terms: list[str] = [category_slug]
+        names = await self.get_category_names()
+        if category_slug in names:
+            terms.append(names[category_slug])
+        for alias, target in _CATEGORY_ALIASES.items():
+            if target == category_slug:
+                terms.append(alias)
+        return terms

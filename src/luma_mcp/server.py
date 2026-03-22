@@ -136,7 +136,7 @@ async def _resolve_defaults(
             "[agent] No location configured. Ask the user where they want to "
             "search, then call set_preferences.\n\n"
             "Option 1 — by city/region:\n"
-            f"  set_preferences(city=\"<slug>\")  available: {city_list}\n\n"
+            f"  set_preferences(city=\"<city>\")  available: {city_list}\n\n"
             "Option 2 — near an exact address (enables distance filtering):\n"
             '  set_preferences(address="street address", max_distance_miles=15)\n\n'
             "The user can also combine both."
@@ -304,10 +304,10 @@ async def set_preferences(
     and retry, or ask the user to clarify.
 
     Args:
-        city: Luma region slug or name (e.g. "sf", "san francisco", "london").
+        city: Luma city (e.g. "sf", "san francisco", "london").
         address: Street address for distance filtering center point.
         max_distance_miles: Default search radius in miles.
-        category: Event category slug or synonym (e.g. "ai", "tech", "machine learning").
+        category: Event category (e.g. "ai", "tech", "machine learning").
         skip: Permanently decline the save-defaults prompt.
     """
     store = _get_event_store()
@@ -328,9 +328,9 @@ async def set_preferences(
             saved["city"] = match.slug
         elif match.candidates:
             messages.append(
-                f"[agent] \"{city}\" is not an exact Luma city slug. "
+                f"[agent] \"{city}\" is not a recognized Luma city. "
                 f"Closest: {', '.join(match.candidates)}. "
-                f"Pick the best match and call set_preferences(city=\"<slug>\"), "
+                f"Pick the best match and call set_preferences(city=\"<city>\"), "
                 f"or clarify with the user if ambiguous."
             )
         else:
@@ -352,9 +352,9 @@ async def set_preferences(
             saved["category"] = match.slug
         elif match.candidates:
             messages.append(
-                f"[agent] \"{category}\" is not an exact Luma category slug. "
+                f"[agent] \"{category}\" is not a recognized Luma category. "
                 f"Closest: {', '.join(match.candidates)}. "
-                f"Pick the best match and call set_preferences(category=\"<slug>\"), "
+                f"Pick the best match and call set_preferences(category=\"<category>\"), "
                 f"or clarify with the user if ambiguous."
             )
         else:
@@ -436,8 +436,8 @@ async def search_events(
       but never relay them verbatim. If `messages` is empty, just show results.
 
     Args:
-        city: Discover region slug or name (e.g. "sf", "london", "los angeles"). Overrides saved default.
-        category: Discover category slug or synonym (e.g. "ai", "tech", "food"). Overrides saved default.
+        city: Luma city (e.g. "sf", "london", "los angeles"). Overrides saved default.
+        category: Event category (e.g. "ai", "tech", "food"). Overrides saved default.
         center_address: Street address for distance filtering center. Overrides saved default.
         max_distance_miles: Maximum distance in miles from center. Overrides saved default.
         keywords: Filter by keywords (matches title/description). Prefer category for broad topics.
@@ -505,7 +505,7 @@ async def search_events(
                         for s in await registry.city_slugs()
                     )
                 messages.append(
-                    f"[agent] \"{city}\" is not a known Luma city slug. "
+                    f"[agent] \"{city}\" is not a recognized Luma city. "
                     f"Pick the best match and rerun, or clarify with the user if ambiguous.\n"
                     f"Closest: {options}"
                 )
@@ -529,23 +529,34 @@ async def search_events(
                         for s in await registry.category_slugs()
                     )
                 messages.append(
-                    f"[agent] \"{category}\" is not a known Luma category slug. "
+                    f"[agent] \"{category}\" is not a recognized Luma category. "
                     f"Pick the best match and rerun, or clarify with the user if ambiguous.\n"
                     f"Available: {options}"
                 )
                 return {"events": [], "count": 0, "messages": messages}
 
-    # Luma's API ignores category when place is also set, so when the user
-    # asks for a category we drop the place filter and rely on our own
-    # distance filtering to narrow by geography.
-    effective_place = None if category_api_id else place_api_id
+    # Luma's API ignores category when place is also set, and when logged in
+    # the category-only endpoint returns only the user's home-area events.
+    # Strategy: always use place when available; apply category as client-side
+    # keyword filtering so it works reliably for any city.
+    category_keywords: Optional[list[str]] = None
+    if category_api_id and place_api_id:
+        category_keywords = await registry.category_keywords(category)
+        effective_place = place_api_id
+        effective_category = None
+    elif category_api_id:
+        effective_place = None
+        effective_category = category_api_id
+    else:
+        effective_place = place_api_id
+        effective_category = None
 
     # Discover
     try:
         web = _get_web_client(session_cookie)
         discover = await web.discover_events(
             place_api_id=effective_place,
-            category_api_id=category_api_id,
+            category_api_id=effective_category,
             after=after_dt,
             before=before_dt,
         )
@@ -573,22 +584,18 @@ async def search_events(
     drop_unknown = exclude_unknown_location
 
     # When there's no explicit address to filter around, fall back to the
-    # city center so subscribed-calendar events (which are global) and
-    # category-only results get geo-filtered properly.
+    # city center so subscribed-calendar events (which are global) get
+    # geo-filtered properly.
     if filter_lat is None and city:
         home_city = _stored_default(store, "default_city")
-        need_fallback = category_api_id or (city != home_city)
-        if need_fallback:
-            places = await registry.get_places()
-            info = places.get(city)
-            if info:
-                _pid, filter_lat, filter_lon = info
-                if filter_dist is None:
-                    filter_dist = 25.0
-                # Only exclude unknown-location events when searching a
-                # foreign city; in the user's home city they're likely local.
-                if city != home_city:
-                    drop_unknown = True
+        places = await registry.get_places()
+        info = places.get(city)
+        if info:
+            _pid, filter_lat, filter_lon = info
+            if filter_dist is None:
+                filter_dist = 25.0
+            if city != home_city:
+                drop_unknown = True
 
     if filter_lat is not None and filter_lon is not None and filter_dist is not None:
         events = filter_by_distance(
@@ -598,6 +605,11 @@ async def search_events(
             filter_dist,
             exclude_unknown_location=drop_unknown,
         )
+
+    # When both city + category are requested, the API can't filter both
+    # server-side — we fetch the city's events and filter by category keywords.
+    if category_keywords:
+        events = filter_by_keywords(events, category_keywords)
 
     if keywords:
         events = filter_by_keywords(events, keywords)
@@ -664,7 +676,7 @@ async def get_event(event_id: Optional[str] = None, url: Optional[str] = None) -
 
     Args:
         event_id: Luma event API id (e.g. "evt-abc123").
-        url: lu.ma event URL or slug (e.g. "https://lu.ma/myevent" or "myevent").
+        url: lu.ma event URL or ID (e.g. "https://lu.ma/myevent" or "myevent").
     """
     if not event_id and not url:
         return {"error": "Provide either event_id or url."}
@@ -693,7 +705,7 @@ async def export_event_ics(event_id: Optional[str] = None, url: Optional[str] = 
 
     Args:
         event_id: Luma event API id (e.g. "evt-abc123").
-        url: lu.ma event URL or slug.
+        url: lu.ma event URL or ID.
     """
     detail = await get_event(event_id=event_id, url=url)
     if "error" in detail:
