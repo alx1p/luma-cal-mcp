@@ -45,8 +45,8 @@ class LumaWebClient:
     async def discover_events(
         self,
         *,
-        geo_region_slug: Optional[str] = None,
-        category: Optional[str] = None,
+        place_api_id: Optional[str] = None,
+        category_api_id: Optional[str] = None,
         after: Optional[datetime] = None,
         before: Optional[datetime] = None,
     ) -> list[LumaEvent]:
@@ -64,10 +64,10 @@ class LumaWebClient:
 
         for _ in range(_MAX_PAGES):
             params: dict[str, str | int] = {"pagination_limit": _PAGE_SIZE}
-            if geo_region_slug:
-                params["geo_region_slug"] = geo_region_slug
-            if category:
-                params["category"] = category
+            if place_api_id:
+                params["discover_place_api_id"] = place_api_id
+            if category_api_id:
+                params["discover_category_api_id"] = category_api_id
             if cursor:
                 params["pagination_cursor"] = cursor
 

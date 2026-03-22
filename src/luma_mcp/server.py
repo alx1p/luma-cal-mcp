@@ -16,6 +16,7 @@ from luma_mcp.event_store import EventStore
 from luma_mcp.geo import filter_by_distance, filter_by_keywords, haversine_miles
 from luma_mcp.geocode import geocode
 from luma_mcp.ics import build_ics
+from luma_mcp.luma_registry import LumaRegistry, MatchResult
 from luma_mcp.luma_web_client import LumaWebClient
 from luma_mcp.models import LumaEvent, merge_events
 
@@ -25,30 +26,10 @@ _config: Optional[Config] = None
 _web_client: Optional[LumaWebClient] = None
 _web_client_cookie: Optional[str] = None
 _event_store: Optional[EventStore] = None
+_registry: Optional[LumaRegistry] = None
 
 _VALIDATION_MAX_AGE = timedelta(hours=24)
 _NEVER_TIMESTAMP = "9999-12-31T23:59:59+00:00"
-
-LUMA_CITY_CENTERS: dict[str, tuple[float, float]] = {
-    "sf-bay-area": (37.7749, -122.4194),
-    "new-york": (40.7128, -74.0060),
-    "los-angeles": (34.0522, -118.2437),
-    "chicago": (41.8781, -87.6298),
-    "seattle": (47.6062, -122.3321),
-    "austin": (30.2672, -97.7431),
-    "boston": (42.3601, -71.0589),
-    "miami": (25.7617, -80.1918),
-    "denver": (39.7392, -104.9903),
-    "london": (51.5074, -0.1278),
-    "paris": (48.8566, 2.3522),
-    "berlin": (52.5200, 13.4050),
-    "tokyo": (35.6762, 139.6503),
-    "singapore": (1.3521, 103.8198),
-    "sydney": (-33.8688, 151.2093),
-    "toronto": (43.6532, -79.3832),
-    "amsterdam": (52.3676, 4.9041),
-}
-
 
 def _get_config() -> Config:
     global _config
@@ -64,6 +45,13 @@ def _get_event_store() -> EventStore:
         db_path = Path(cfg.event_store_path) if cfg.event_store_path else None
         _event_store = EventStore(db_path=db_path)
     return _event_store
+
+
+def _get_registry() -> LumaRegistry:
+    global _registry
+    if _registry is None:
+        _registry = LumaRegistry(_get_event_store())
+    return _registry
 
 
 def _get_web_client(session_cookie: Optional[str] = None) -> LumaWebClient:
@@ -90,11 +78,12 @@ def _stored_default(store: EventStore, key: str) -> Optional[str]:
     return row[0] if row else None
 
 
-def _nearest_city(lat: float, lon: float) -> str:
+async def _nearest_city(lat: float, lon: float) -> str:
     """Return the Luma city slug closest to the given coordinates."""
-    best_slug = "sf-bay-area"
+    places = await _get_registry().get_places()
+    best_slug = "sf"
     best_dist = float("inf")
-    for slug, (clat, clon) in LUMA_CITY_CENTERS.items():
+    for slug, (_pid, clat, clon) in places.items():
         d = haversine_miles(lat, lon, clat, clon)
         if d < best_dist:
             best_dist = d
@@ -107,7 +96,7 @@ def _nearest_city(lat: float, lon: float) -> str:
 # --------------------------------------------------------------------------
 
 
-def _resolve_defaults(
+async def _resolve_defaults(
     store: EventStore,
     messages: list[str],
     *,
@@ -131,12 +120,19 @@ def _resolve_defaults(
 
     eff_city = city or stored_city
     eff_category = category or stored_category
-    eff_address = center_address or stored_address
-    eff_distance = max_distance_miles or (float(stored_distance) if stored_distance else None)
+
+    # When city is explicitly overridden to a different region, the stored
+    # address/distance (tied to the default city) don't apply.
+    city_overridden = city and stored_city and city != stored_city
+    eff_address = center_address or (None if city_overridden else stored_address)
+    eff_distance = max_distance_miles or (
+        None if city_overridden
+        else (float(stored_distance) if stored_distance else None)
+    )
 
     has_location = eff_city or eff_address
     if not has_location:
-        city_list = ", ".join(LUMA_CITY_CENTERS.keys())
+        city_list = ", ".join(await _get_registry().city_slugs())
         messages.append(
             "[agent] No location configured. Ask the user where they want to "
             "search, then call set_preferences.\n\n"
@@ -304,19 +300,61 @@ async def set_preferences(
     inferred automatically from the address coordinates.
 
     Args:
-        city: Luma region slug (e.g. "sf-bay-area", "new-york").
+        city: Luma region slug (e.g. "sf", "nyc", "london").
         address: Street address for distance filtering center point.
         max_distance_miles: Default search radius in miles.
         category: Event category (e.g. "ai", "tech", "crypto").
         skip: Permanently decline the save-defaults prompt.
     """
     store = _get_event_store()
+    registry = _get_registry()
 
     if skip:
         store.set_setting("defaults_declined", "true")
         return {"status": "ok", "message": "Defaults prompt permanently dismissed."}
 
     saved: dict[str, str] = {}
+    messages: list[str] = []
+
+    # Validate & resolve city
+    if city is not None:
+        match = await registry.match_city(city)
+        if match.exact:
+            store.set_setting("default_city", match.slug)
+            saved["city"] = match.slug
+        elif match.slug:
+            messages.append(
+                f"[agent] \"{city}\" is not an exact Luma city. "
+                f"Did the user mean \"{match.slug}\"? "
+                f"Confirm with the user, then call set_preferences(city=\"{match.slug}\").\n"
+                f"Other options: {', '.join(match.candidates)}"
+            )
+        else:
+            all_cities = ", ".join(await registry.city_slugs())
+            messages.append(
+                f"[agent] \"{city}\" doesn't match any Luma city. "
+                f"Ask the user to pick from: {all_cities}"
+            )
+
+    # Validate & resolve category
+    if category is not None:
+        match = await registry.match_category(category)
+        if match.exact:
+            store.set_setting("default_category", match.slug)
+            saved["category"] = match.slug
+        elif match.slug:
+            messages.append(
+                f"[agent] \"{category}\" is not an exact Luma category. "
+                f"Did the user mean \"{match.slug}\"? "
+                f"Confirm with the user, then call set_preferences(category=\"{match.slug}\").\n"
+                f"Other options: {', '.join(match.candidates)}"
+            )
+        else:
+            all_cats = ", ".join(await registry.category_slugs())
+            messages.append(
+                f"[agent] \"{category}\" doesn't match any Luma category. "
+                f"Ask the user to pick from: {all_cats}"
+            )
 
     if address is not None:
         store.set_setting("default_center_address", address)
@@ -325,21 +363,13 @@ async def set_preferences(
         if city is None and not _stored_default(store, "default_city"):
             lat, lon = _geocode_fn(address)
             if lat is not None and lon is not None:
-                inferred = _nearest_city(lat, lon)
+                inferred = await _nearest_city(lat, lon)
                 store.set_setting("default_city", inferred)
                 saved["city"] = f"{inferred} (inferred from address)"
-
-    if city is not None:
-        store.set_setting("default_city", city)
-        saved["city"] = city
 
     if max_distance_miles is not None:
         store.set_setting("default_max_distance_miles", str(max_distance_miles))
         saved["max_distance_miles"] = str(max_distance_miles)
-
-    if category is not None:
-        store.set_setting("default_category", category)
-        saved["category"] = category
 
     current = {
         "city": _stored_default(store, "default_city"),
@@ -348,7 +378,10 @@ async def set_preferences(
         "category": _stored_default(store, "default_category"),
     }
 
-    return {"saved": saved, "current_preferences": current}
+    result: dict = {"saved": saved, "current_preferences": current}
+    if messages:
+        result["messages"] = messages
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -366,9 +399,10 @@ async def search_events(
     after: Optional[str] = None,
     before: Optional[str] = None,
     exclude_unknown_location: bool = False,
-    latin_only: bool = True,
+    latin_only: Optional[bool] = None,
     added_within_days: Optional[float] = None,
     new_only: bool = False,
+    sort: Optional[str] = None,
     login: bool = False,
     skip_login_days: Optional[int] = None,
 ) -> dict:
@@ -379,7 +413,7 @@ async def search_events(
     distance, and category. Pass explicit values to override for one search.
 
     Args:
-        city: Discover region slug (e.g. "sf-bay-area", "new-york"). Overrides saved default.
+        city: Discover region slug (e.g. "sf", "nyc", "london"). Overrides saved default.
         category: Discover category filter (e.g. "ai", "tech", "crypto"). Overrides saved default.
         center_address: Street address for distance filtering center. Overrides saved default.
         max_distance_miles: Maximum distance in miles from center. Overrides saved default.
@@ -387,9 +421,10 @@ async def search_events(
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
         exclude_unknown_location: If true, drop events without coordinates.
-        latin_only: Filter out non-Latin-script events (default true).
+        latin_only: Filter out non-Latin-script events. Auto-detected from city region when not set (off for Asia-Pacific, on otherwise).
         added_within_days: Only return events first seen within this many days.
         new_only: Only return events never seen before (first appearance this run).
+        sort: Sort order — "date" (default), "distance" (nearest first), or "newest" (most recently discovered first).
         login: Set to true to open browser and log in to Luma.
         skip_login_days: Decline login for N days (0 = ask next time, -1 = never).
     """
@@ -399,7 +434,7 @@ async def search_events(
     store = _get_event_store()
 
     # Location first — no search without it
-    city, category, center_address, max_dist, needs_location = _resolve_defaults(
+    city, category, center_address, max_dist, needs_location = await _resolve_defaults(
         store, messages,
         city=city, category=category, center_address=center_address,
         max_distance_miles=max_distance_miles,
@@ -425,14 +460,47 @@ async def search_events(
 
     # Infer city from address coordinates when not explicitly set
     if not city and resolved_lat is not None and resolved_lon is not None:
-        city = _nearest_city(resolved_lat, resolved_lon)
+        city = await _nearest_city(resolved_lat, resolved_lon)
+
+    # Resolve slugs → Luma API IDs (with fuzzy matching)
+    registry = _get_registry()
+    place_api_id: Optional[str] = None
+    if city:
+        place_api_id = await registry.resolve_place(city)
+        if place_api_id is None:
+            match = await registry.match_city(city)
+            if match.slug:
+                place_api_id = await registry.resolve_place(match.slug)
+                city = match.slug
+                messages.append(
+                    f"[agent] Interpreted city \"{city}\" as \"{match.slug}\". "
+                    "If that's wrong, the user can correct it."
+                )
+
+    category_api_id: Optional[str] = None
+    if category:
+        category_api_id = await registry.resolve_category(category)
+        if category_api_id is None:
+            match = await registry.match_category(category)
+            if match.slug:
+                category_api_id = await registry.resolve_category(match.slug)
+                category = match.slug
+                messages.append(
+                    f"[agent] Interpreted category \"{category}\" as \"{match.slug}\". "
+                    "If that's wrong, the user can correct it."
+                )
+
+    # Luma's API ignores category when place is also set, so when the user
+    # asks for a category we drop the place filter and rely on our own
+    # distance filtering to narrow by geography.
+    effective_place = None if category_api_id else place_api_id
 
     # Discover
     try:
         web = _get_web_client(session_cookie)
         discover = await web.discover_events(
-            geo_region_slug=city,
-            category=category,
+            place_api_id=effective_place,
+            category_api_id=category_api_id,
             after=after_dt,
             before=before_dt,
         )
@@ -449,24 +517,50 @@ async def search_events(
         except Exception as e:
             messages.append(f"Subscribed calendars error: {e}")
 
-    events = merge_events(event_lists)
+    events = _backfill_known_coords(merge_events(event_lists))
 
     if after_dt:
         events = [e for e in events if e.start_at >= after_dt]
     if before_dt:
         events = [e for e in events if e.start_at <= before_dt]
 
-    if resolved_lat is not None and resolved_lon is not None and max_dist is not None:
+    filter_lat, filter_lon, filter_dist = resolved_lat, resolved_lon, max_dist
+    drop_unknown = exclude_unknown_location
+
+    # When there's no explicit address to filter around, fall back to the
+    # city center so subscribed-calendar events (which are global) and
+    # category-only results get geo-filtered properly.
+    if filter_lat is None and city:
+        home_city = _stored_default(store, "default_city")
+        need_fallback = category_api_id or (city != home_city)
+        if need_fallback:
+            places = await registry.get_places()
+            info = places.get(city)
+            if info:
+                _pid, filter_lat, filter_lon = info
+                if filter_dist is None:
+                    filter_dist = 50.0
+                # Only exclude unknown-location events when searching a
+                # foreign city; in the user's home city they're likely local.
+                if city != home_city:
+                    drop_unknown = True
+
+    if filter_lat is not None and filter_lon is not None and filter_dist is not None:
         events = filter_by_distance(
             events,
-            resolved_lat,
-            resolved_lon,
-            max_dist,
-            exclude_unknown_location=exclude_unknown_location,
+            filter_lat,
+            filter_lon,
+            filter_dist,
+            exclude_unknown_location=drop_unknown,
         )
 
     if keywords:
         events = filter_by_keywords(events, keywords)
+
+    # Auto-detect latin_only from city continent when not explicitly set
+    if latin_only is None:
+        continent = await registry.continent_of(city) if city else None
+        latin_only = continent != "apac"
 
     if latin_only:
         events = [e for e in events if _is_latin_event(e)]
@@ -492,6 +586,20 @@ async def search_events(
             s for s in summaries
             if s["first_seen_at"] and datetime.fromisoformat(s["first_seen_at"]) >= cutoff
         ]
+
+    if sort == "distance":
+        summaries.sort(key=lambda s: s.get("distance_miles", float("inf")))
+    elif sort == "newest":
+        summaries.sort(key=lambda s: s.get("first_seen_at") or "", reverse=True)
+
+    # Category prompt — last in message order, only when not set anywhere
+    if not category and not _stored_default(store, "default_category"):
+        cat_list = ", ".join(await _get_registry().category_slugs())
+        messages.append(
+            "[agent] No category filter is set. Ask the user if they want to "
+            "filter by a category. If they pick one, rerun search_events "
+            f"with category=\"...\".\n\nAvailable: {cat_list}"
+        )
 
     return {
         "events": summaries,
@@ -627,8 +735,11 @@ def _extract_city(full_address: Optional[str]) -> Optional[str]:
     return None
 
 
-_KNOWN_VENUES: dict[str, str] = {
-    "550 laguna st, san francisco": "The Commons",
+_KnownVenue = tuple[str, float, float]  # (display_name, lat, lon)
+
+_KNOWN_VENUES: dict[str, _KnownVenue] = {
+    "550 laguna st": ("The Commons", 37.7764, -122.4225),
+    "540 laguna st": ("The Commons", 37.7764, -122.4225),
 }
 
 
@@ -638,12 +749,26 @@ def _venue_name(label: Optional[str]) -> Optional[str]:
         return None
     stripped = label.strip()
     lower = stripped.lower()
-    for prefix, name in _KNOWN_VENUES.items():
+    for prefix, (name, _lat, _lon) in _KNOWN_VENUES.items():
         if lower.startswith(prefix):
             return name
     if stripped and stripped[0].isdigit():
         return None
     return stripped
+
+
+def _backfill_known_coords(events: list[LumaEvent]) -> list[LumaEvent]:
+    """Fill in lat/lon for events at known venues that lack coordinates."""
+    result: list[LumaEvent] = []
+    for ev in events:
+        if not ev.has_coordinates and ev.location_label:
+            lower = ev.location_label.strip().lower()
+            for prefix, (_name, lat, lon) in _KNOWN_VENUES.items():
+                if lower.startswith(prefix):
+                    ev = ev.model_copy(update={"lat": lat, "lon": lon})
+                    break
+        result.append(ev)
+    return result
 
 
 def _event_summary(event: LumaEvent) -> dict:

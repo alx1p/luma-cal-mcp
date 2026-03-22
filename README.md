@@ -55,7 +55,7 @@ set_preferences(address="3180 18th St, San Francisco", max_distance_miles=15)
 set_preferences(category="ai")
 ```
 
-When you provide an address without a city, the nearest Luma region is inferred automatically. You can also set `city` explicitly (e.g. `city="sf-bay-area"`).
+When you provide an address without a city, the nearest Luma region is inferred automatically. You can also set `city` explicitly (e.g. `city="sf"`).
 
 ### Run
 
