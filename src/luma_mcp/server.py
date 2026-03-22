@@ -114,7 +114,6 @@ def _resolve_defaults(
     category: Optional[str],
     center_address: Optional[str],
     max_distance_miles: Optional[float],
-    suppress_prompt: bool = False,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[float], bool]:
     """Resolve city/category/address/distance with precedence: param > stored DB default.
 
@@ -135,7 +134,7 @@ def _resolve_defaults(
     eff_distance = max_distance_miles or (float(stored_distance) if stored_distance else None)
 
     has_location = eff_city or eff_address
-    if not has_location and not suppress_prompt:
+    if not has_location:
         city_list = ", ".join(LUMA_CITY_CENTERS.keys())
         messages.append(
             "[agent] No location configured. Ask the user where they want to "
@@ -149,7 +148,7 @@ def _resolve_defaults(
         return eff_city, eff_category, eff_address, eff_distance, True
 
     # Offer to save explicitly-passed values that aren't stored yet
-    if not suppress_prompt and not _stored_default(store, "defaults_declined"):
+    if not _stored_default(store, "defaults_declined"):
         save_hints: list[str] = []
         if city and not stored_city:
             save_hints.append(f'city="{city}"')
@@ -232,8 +231,10 @@ async def _resolve_session(
 
     # First time ever, or previously declined and window expired — prompt
     messages.append(
-        "[agent] Ask the user: \"Would you like to log in to Luma to also see "
-        "events from your subscribed calendars? (yes / no / never ask again)\"\n\n"
+        "[agent] Results above are from Luma Discover (public events). "
+        "The user can also log in to see events from calendars they follow "
+        "on Luma, which may surface more results. Ask if they want to connect "
+        "their Luma account for additional events.\n\n"
         "On yes: call search_events with login=true\n"
         "On no: call search_events with skip_login_days=0\n"
         "On never: call search_events with skip_login_days=-1"
@@ -394,22 +395,21 @@ async def search_events(
     messages: list[str] = []
     store = _get_event_store()
 
-    # Login prompt takes priority — one prompt at a time
-    session_cookie, login_prompted = await _resolve_session(
-        store, messages,
-        login=login, skip_login_days=skip_login_days,
-    )
-
-    # Resolve preferences — defer defaults prompt if login was just prompted
+    # Location first — no search without it
     city, category, center_address, max_dist, needs_location = _resolve_defaults(
         store, messages,
         city=city, category=category, center_address=center_address,
         max_distance_miles=max_distance_miles,
-        suppress_prompt=login_prompted,
     )
 
     if needs_location:
         return {"events": [], "count": 0, "messages": messages}
+
+    # Login second — defer prompt if location was just set up this call
+    session_cookie, _login_prompted = await _resolve_session(
+        store, messages,
+        login=login, skip_login_days=skip_login_days,
+    )
 
     after_dt = _parse_dt(after)
     before_dt = _parse_dt(before)
@@ -599,15 +599,31 @@ def _extract_city(full_address: Optional[str]) -> Optional[str]:
     return parts[-2]
 
 
+def _venue_name(label: Optional[str]) -> Optional[str]:
+    """Return the venue name, or None if it looks like a bare street address."""
+    if not label:
+        return None
+    stripped = label.strip()
+    if stripped and stripped[0].isdigit():
+        return None
+    return stripped
+
+
 def _event_summary(event: LumaEvent) -> dict:
+    venue = _venue_name(event.location_label)
+    city = _extract_city(event.full_address)
+    if venue and city:
+        location = f"{venue}, {city}"
+    else:
+        location = venue or city
+
     d: dict = {
         "id": event.id,
         "title": event.title,
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
-        "city": _extract_city(event.full_address),
-        "venue": event.location_label,
+        "location": location,
         "url": event.canonical_url,
     }
     if event.distance_miles is not None:
