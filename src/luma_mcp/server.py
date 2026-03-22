@@ -668,6 +668,17 @@ def _local_dt(dt: datetime, _tz_name: Optional[str] = None) -> str:
     return dt.astimezone().isoformat()
 
 
+def _short_date(dt: datetime) -> str:
+    """Format a datetime as 'Sat Mar 22, 2pm' in the user's system timezone."""
+    local = dt.astimezone()
+    minute = local.minute
+    if minute:
+        time_str = local.strftime("%-I:%M%p").lower()
+    else:
+        time_str = local.strftime("%-I%p").lower()
+    return f"{local.strftime('%a %b %-d')}, {time_str}"
+
+
 _STATE_ZIP_RE = re.compile(r"^[A-Z]{2}\s+\d{4,5}")
 
 
@@ -762,12 +773,15 @@ def _event_summary(event: LumaEvent) -> dict:
         max_venue = _MAX_LOCATION_LEN - len(city) - 2  # room for ", City"
         truncated_venue = _esc(venue, max(max_venue, 10))
         location = f"{truncated_venue}, {city}"
+    elif venue:
+        location = _esc(venue, _MAX_LOCATION_LEN)
     else:
-        location = venue or city
+        location = city
 
     d: dict = {
         "id": event.id,
         "title": _esc(event.title, _MAX_TITLE_LEN),
+        "date": _short_date(event.start_at),
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
