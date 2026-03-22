@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 from luma_mcp.models import LumaEvent
 
@@ -62,19 +61,3 @@ def filter_by_keywords(
     return result
 
 
-def resolve_center(
-    center_lat: Optional[float],
-    center_lon: Optional[float],
-    center_address: Optional[str],
-    *,
-    geocode_fn,
-) -> tuple[Optional[float], Optional[float]]:
-    """Return (lat, lon) from explicit coords or geocoded address.
-
-    Explicit lat/lon takes precedence over address.
-    """
-    if center_lat is not None and center_lon is not None:
-        return center_lat, center_lon
-    if center_address:
-        return geocode_fn(center_address)
-    return None, None

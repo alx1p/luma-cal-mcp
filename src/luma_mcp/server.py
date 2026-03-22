@@ -1,7 +1,8 @@
-"""Luma MCP server — 3 tools for event discovery, details, and calendar export."""
+"""Luma MCP server — tools for event discovery, details, preferences, and calendar export."""
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -11,7 +12,7 @@ from fastmcp import FastMCP
 
 from luma_mcp.config import Config, load_config
 from luma_mcp.event_store import EventStore
-from luma_mcp.geo import filter_by_distance, filter_by_keywords, resolve_center
+from luma_mcp.geo import filter_by_distance, filter_by_keywords, haversine_miles
 from luma_mcp.geocode import geocode
 from luma_mcp.ics import build_ics
 from luma_mcp.luma_web_client import LumaWebClient
@@ -26,6 +27,26 @@ _event_store: Optional[EventStore] = None
 
 _VALIDATION_MAX_AGE = timedelta(hours=24)
 _NEVER_TIMESTAMP = "9999-12-31T23:59:59+00:00"
+
+LUMA_CITY_CENTERS: dict[str, tuple[float, float]] = {
+    "sf-bay-area": (37.7749, -122.4194),
+    "new-york": (40.7128, -74.0060),
+    "los-angeles": (34.0522, -118.2437),
+    "chicago": (41.8781, -87.6298),
+    "seattle": (47.6062, -122.3321),
+    "austin": (30.2672, -97.7431),
+    "boston": (42.3601, -71.0589),
+    "miami": (25.7617, -80.1918),
+    "denver": (39.7392, -104.9903),
+    "london": (51.5074, -0.1278),
+    "paris": (48.8566, 2.3522),
+    "berlin": (52.5200, 13.4050),
+    "tokyo": (35.6762, 139.6503),
+    "singapore": (1.3521, 103.8198),
+    "sydney": (-33.8688, 151.2093),
+    "toronto": (43.6532, -79.3832),
+    "amsterdam": (52.3676, 4.9041),
+}
 
 
 def _get_config() -> Config:
@@ -68,85 +89,87 @@ def _stored_default(store: EventStore, key: str) -> Optional[str]:
     return row[0] if row else None
 
 
+def _nearest_city(lat: float, lon: float) -> str:
+    """Return the Luma city slug closest to the given coordinates."""
+    best_slug = "sf-bay-area"
+    best_dist = float("inf")
+    for slug, (clat, clon) in LUMA_CITY_CENTERS.items():
+        d = haversine_miles(lat, lon, clat, clon)
+        if d < best_dist:
+            best_dist = d
+            best_slug = slug
+    return best_slug
+
+
+# --------------------------------------------------------------------------
+# Preference resolution
+# --------------------------------------------------------------------------
+
+
 def _resolve_defaults(
     store: EventStore,
-    cfg: Config,
     messages: list[str],
     *,
     city: Optional[str],
     category: Optional[str],
     center_address: Optional[str],
     max_distance_miles: Optional[float],
-    set_default_city: Optional[str],
-    set_default_category: Optional[str],
-    set_default_address: Optional[str],
-    set_default_max_distance: Optional[float],
-    skip_defaults: bool,
     suppress_prompt: bool = False,
-) -> tuple[Optional[str], Optional[str], Optional[str], Optional[float]]:
-    """Resolve city/category/address/distance with precedence: param > DB > env.
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[float], bool]:
+    """Resolve city/category/address/distance with precedence: param > stored DB default.
 
-    Persists any set_default_* values. Keeps prompting to save defaults
-    until at least one is stored or the user declines.
+    If no city or address is available from any source, adds a prompt for the
+    agent telling it to call set_preferences.  Returns ``needs_location=True``
+    so the caller can short-circuit.
 
-    ``suppress_prompt`` silently skips the prompt for this call without
-    persisting a decline (used when another prompt like login was shown first).
+    Returns (city, category, address, max_distance_miles, needs_location).
     """
-    if skip_defaults:
-        store.set_setting("defaults_declined", "true")
-
-    if set_default_city is not None:
-        store.set_setting("default_city", set_default_city)
-    if set_default_category is not None:
-        store.set_setting("default_category", set_default_category)
-    if set_default_address is not None:
-        store.set_setting("default_center_address", set_default_address)
-    if set_default_max_distance is not None:
-        store.set_setting("default_max_distance_miles", str(set_default_max_distance))
-
     stored_city = _stored_default(store, "default_city")
     stored_category = _stored_default(store, "default_category")
     stored_address = _stored_default(store, "default_center_address")
     stored_distance = _stored_default(store, "default_max_distance_miles")
 
-    eff_city = city or stored_city or cfg.default_city
-    eff_category = category or stored_category or cfg.default_category
-    eff_address = center_address or stored_address or cfg.default_center_address
-    eff_distance = max_distance_miles or (float(stored_distance) if stored_distance else None) or cfg.default_max_distance_miles
+    eff_city = city or stored_city
+    eff_category = category or stored_category
+    eff_address = center_address or stored_address
+    eff_distance = max_distance_miles or (float(stored_distance) if stored_distance else None)
 
-    has_stored = stored_city or stored_category or stored_address or stored_distance
-    declined = _stored_default(store, "defaults_declined")
-    if not has_stored and not declined and not suppress_prompt:
+    has_location = eff_city or eff_address
+    if not has_location and not suppress_prompt:
+        city_list = ", ".join(LUMA_CITY_CENTERS.keys())
+        messages.append(
+            "[agent] No location configured. Ask the user where they want to "
+            "search, then call set_preferences.\n\n"
+            "Option 1 — by city/region:\n"
+            f"  set_preferences(city=\"<slug>\")  available: {city_list}\n\n"
+            "Option 2 — near an exact address (enables distance filtering):\n"
+            '  set_preferences(address="street address", max_distance_miles=15)\n\n'
+            "The user can also combine both."
+        )
+        return eff_city, eff_category, eff_address, eff_distance, True
+
+    # Offer to save explicitly-passed values that aren't stored yet
+    if not suppress_prompt and not _stored_default(store, "defaults_declined"):
         save_hints: list[str] = []
         if city and not stored_city:
-            save_hints.append(f'  set_default_city="{city}"')
+            save_hints.append(f'city="{city}"')
         if center_address and not stored_address:
-            save_hints.append(f'  set_default_address="{center_address}"')
-        if category and not stored_category:
-            save_hints.append(f'  set_default_category="{category}"')
+            save_hints.append(f'address="{center_address}"')
         if max_distance_miles and not stored_distance:
-            save_hints.append(f'  set_default_max_distance={max_distance_miles}')
-
-        decline_hint = "\n\nOr skip_defaults=true to stop asking."
+            save_hints.append(f"max_distance_miles={max_distance_miles}")
+        if category and not stored_category:
+            save_hints.append(f'category="{category}"')
         if save_hints:
             messages.append(
-                "Want to save these as your defaults for future searches? "
-                "Call search_events with:\n"
-                + "\n".join(save_hints)
-                + decline_hint
-            )
-        else:
-            messages.append(
-                "No default preferences configured. "
-                "You can set persistent defaults by calling search_events with:\n"
-                '  set_default_address="your address"\n'
-                '  set_default_category="ai" (or tech, crypto, food-drink, etc.)\n'
-                '  set_default_city="sf-bay-area" (or new-york, los-angeles, etc.)\n'
-                "  set_default_max_distance=15"
-                + decline_hint
+                "[agent] The user passed values that aren't saved as defaults yet. "
+                "Ask them: \"Save these as your defaults for future searches? "
+                "(yes / no / never ask again)\"\n\n"
+                f"On yes: call set_preferences({', '.join(save_hints)})\n"
+                "On no: do nothing (will ask again next time)\n"
+                "On never: call set_preferences(skip=true)"
             )
 
-    return eff_city, eff_category, eff_address, eff_distance
+    return eff_city, eff_category, eff_address, eff_distance, False
 
 
 # --------------------------------------------------------------------------
@@ -157,7 +180,6 @@ async def _resolve_session(
     store: EventStore,
     messages: list[str],
     *,
-    no_login: bool,
     login: bool,
     skip_login_days: Optional[int],
 ) -> tuple[Optional[str], bool]:
@@ -166,9 +188,6 @@ async def _resolve_session(
     Returns (cookie, prompted).  ``prompted`` is True when a login prompt was
     added to messages, so callers can defer other prompts.
     """
-    if no_login:
-        return None, False
-
     # Handle explicit skip_login_days from a prior prompt answer
     if skip_login_days is not None:
         if skip_login_days < 0:
@@ -191,7 +210,6 @@ async def _resolve_session(
         declined_until = datetime.fromisoformat(declined_row[0])
         if datetime.now(tz=timezone.utc) < declined_until:
             return None, False
-        # Window expired — clear it so we re-prompt
         store.delete_setting("luma_login_declined_until")
 
     # Try existing cookie
@@ -200,14 +218,12 @@ async def _resolve_session(
         valid = await _validate_if_stale(store, cookie, messages)
         if valid:
             return cookie, False
-        # Cookie expired — clear it
         store.delete_setting("luma_session")
         store.delete_setting("luma_session_validated")
 
     # No valid cookie — check if user ever logged in before
     had_cookie_row = store.get_setting("luma_login_had_cookie")
     if had_cookie_row and had_cookie_row[0] == "true":
-        # Returning user with expired cookie — auto-relogin
         messages.append(
             "Your Luma session expired. Opening browser to re-authenticate..."
         )
@@ -216,10 +232,11 @@ async def _resolve_session(
 
     # First time ever, or previously declined and window expired — prompt
     messages.append(
-        "Would you like to log in to Luma to also see events from your "
-        "subscribed calendars? (Y/n)\n\n"
-        "Call search_events with login=true to log in, or "
-        "skip_login_days=N to decline (0 = ask next time, -1 = never ask again)."
+        "[agent] Ask the user: \"Would you like to log in to Luma to also see "
+        "events from your subscribed calendars? (yes / no / never ask again)\"\n\n"
+        "On yes: call search_events with login=true\n"
+        "On no: call search_events with skip_login_days=0\n"
+        "On never: call search_events with skip_login_days=-1"
     )
     return None, True
 
@@ -265,6 +282,72 @@ def _do_browser_login(store: EventStore, messages: list[str]) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------
+# Tool: set_preferences
+# --------------------------------------------------------------------------
+
+
+@mcp.tool
+async def set_preferences(
+    city: Optional[str] = None,
+    address: Optional[str] = None,
+    max_distance_miles: Optional[float] = None,
+    category: Optional[str] = None,
+    skip: bool = False,
+) -> dict:
+    """Save default search preferences. These persist across restarts.
+
+    When an address is provided without a city, the nearest Luma city is
+    inferred automatically from the address coordinates.
+
+    Args:
+        city: Luma region slug (e.g. "sf-bay-area", "new-york").
+        address: Street address for distance filtering center point.
+        max_distance_miles: Default search radius in miles.
+        category: Event category (e.g. "ai", "tech", "crypto").
+        skip: Permanently decline the save-defaults prompt.
+    """
+    store = _get_event_store()
+
+    if skip:
+        store.set_setting("defaults_declined", "true")
+        return {"status": "ok", "message": "Defaults prompt permanently dismissed."}
+
+    saved: dict[str, str] = {}
+
+    if address is not None:
+        store.set_setting("default_center_address", address)
+        saved["address"] = address
+        # Auto-infer city from address when not explicitly provided
+        if city is None and not _stored_default(store, "default_city"):
+            lat, lon = _geocode_fn(address)
+            if lat is not None and lon is not None:
+                inferred = _nearest_city(lat, lon)
+                store.set_setting("default_city", inferred)
+                saved["city"] = f"{inferred} (inferred from address)"
+
+    if city is not None:
+        store.set_setting("default_city", city)
+        saved["city"] = city
+
+    if max_distance_miles is not None:
+        store.set_setting("default_max_distance_miles", str(max_distance_miles))
+        saved["max_distance_miles"] = str(max_distance_miles)
+
+    if category is not None:
+        store.set_setting("default_category", category)
+        saved["category"] = category
+
+    current = {
+        "city": _stored_default(store, "default_city"),
+        "address": _stored_default(store, "default_center_address"),
+        "max_distance_miles": _stored_default(store, "default_max_distance_miles"),
+        "category": _stored_default(store, "default_category"),
+    }
+
+    return {"saved": saved, "current_preferences": current}
+
+
+# --------------------------------------------------------------------------
 # Tool: search_events
 # --------------------------------------------------------------------------
 
@@ -273,9 +356,6 @@ def _do_browser_login(store: EventStore, messages: list[str]) -> Optional[str]:
 async def search_events(
     city: Optional[str] = None,
     category: Optional[str] = None,
-    source: Optional[str] = None,
-    center_lat: Optional[float] = None,
-    center_lon: Optional[float] = None,
     center_address: Optional[str] = None,
     max_distance_miles: Optional[float] = None,
     keywords: Optional[list[str]] = None,
@@ -287,98 +367,78 @@ async def search_events(
     new_only: bool = False,
     login: bool = False,
     skip_login_days: Optional[int] = None,
-    no_login: bool = False,
-    set_default_address: Optional[str] = None,
-    set_default_category: Optional[str] = None,
-    set_default_city: Optional[str] = None,
-    set_default_max_distance: Optional[float] = None,
-    skip_defaults: bool = False,
 ) -> dict:
-    """Search for Luma events from Discover and/or subscribed calendars.
+    """Search for Luma events from Discover and subscribed calendars.
 
-    Merges events from configured sources, filters by distance from a center
-    point (coordinates or geocoded address) and optional keywords.
+    Filters by distance from a center address, keywords, date range, and more.
+    Uses saved preferences from set_preferences as defaults for city, address,
+    distance, and category. Pass explicit values to override for one search.
 
     Args:
-        city: Discover region slug (e.g. "sf-bay-area", "new-york"). Falls back to stored default, then DEFAULT_CITY env.
-        category: Discover category filter (e.g. "ai", "tech", "crypto"). Falls back to stored default, then DEFAULT_CATEGORY env.
-        source: Which sources to query: "discover", "subscribed", or "all" (default).
-        center_lat: Latitude of the center point for distance filtering.
-        center_lon: Longitude of the center point for distance filtering.
-        center_address: Street address to geocode as the center point (used if lat/lon not provided). Falls back to stored default, then DEFAULT_CENTER_ADDRESS env.
-        max_distance_miles: Maximum distance in miles from the center. Falls back to stored default, then DEFAULT_MAX_DISTANCE_MILES env.
-        keywords: List of keywords to filter by (matches title/description). Empty list means no keyword filter.
+        city: Discover region slug (e.g. "sf-bay-area", "new-york"). Overrides saved default.
+        category: Discover category filter (e.g. "ai", "tech", "crypto"). Overrides saved default.
+        center_address: Street address for distance filtering center. Overrides saved default.
+        max_distance_miles: Maximum distance in miles from center. Overrides saved default.
+        keywords: Filter by keywords (matches title/description).
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
-        exclude_unknown_location: If true, drop events that have no coordinates.
-        latin_only: If true (default), filter out events whose titles are predominantly non-Latin script (e.g. Chinese, Korean, Arabic). Set to false to include all languages.
-        added_within_days: Only return events first seen within this many days (e.g. 5). Requires prior runs to populate the store.
-        new_only: If true, only return events that have never been seen before (first appearance this run).
-        login: Set to true to open a browser and log in to Luma for subscribed calendar access.
-        skip_login_days: Decline Luma login for N days. 0 = ask next time, -1 = never ask again.
-        no_login: If true, skip subscribed calendars for this call without changing stored preferences.
-        set_default_address: Persist a default center address for future calls.
-        set_default_category: Persist a default category for future calls.
-        set_default_city: Persist a default city/region slug for future calls.
-        set_default_max_distance: Persist a default max distance in miles for future calls.
-        skip_defaults: If true, stop asking to save default preferences.
+        exclude_unknown_location: If true, drop events without coordinates.
+        latin_only: Filter out non-Latin-script events (default true).
+        added_within_days: Only return events first seen within this many days.
+        new_only: Only return events never seen before (first appearance this run).
+        login: Set to true to open browser and log in to Luma.
+        skip_login_days: Decline login for N days (0 = ask next time, -1 = never).
     """
     cfg = _get_config()
-    source = source or "all"
-    kw = keywords if keywords is not None else cfg.default_keywords
-
     event_lists: list[list[LumaEvent]] = []
     messages: list[str] = []
-
     store = _get_event_store()
 
-    # Resolve session cookie first — login prompt takes priority over defaults
-    session_cookie: Optional[str] = None
-    login_prompted = False
-    want_subscribed = source in ("all", "subscribed")
-    if want_subscribed:
-        session_cookie, login_prompted = await _resolve_session(
-            store, messages,
-            no_login=no_login, login=login, skip_login_days=skip_login_days,
-        )
+    # Login prompt takes priority — one prompt at a time
+    session_cookie, login_prompted = await _resolve_session(
+        store, messages,
+        login=login, skip_login_days=skip_login_days,
+    )
 
     # Resolve preferences — defer defaults prompt if login was just prompted
-    city, category, center_address, max_dist = _resolve_defaults(
-        store, cfg, messages,
+    city, category, center_address, max_dist, needs_location = _resolve_defaults(
+        store, messages,
         city=city, category=category, center_address=center_address,
         max_distance_miles=max_distance_miles,
-        set_default_city=set_default_city,
-        set_default_category=set_default_category,
-        set_default_address=set_default_address,
-        set_default_max_distance=set_default_max_distance,
-        skip_defaults=skip_defaults,
         suppress_prompt=login_prompted,
     )
+
+    if needs_location:
+        return {"events": [], "count": 0, "messages": messages}
 
     after_dt = _parse_dt(after)
     before_dt = _parse_dt(before)
 
-    resolved_lat, resolved_lon = resolve_center(
-        center_lat or cfg.default_center_lat,
-        center_lon or cfg.default_center_lon,
-        center_address,
-        geocode_fn=_geocode_fn,
-    )
+    # Geocode address for distance filtering and city inference
+    resolved_lat: Optional[float] = None
+    resolved_lon: Optional[float] = None
+    if center_address:
+        resolved_lat, resolved_lon = _geocode_fn(center_address)
 
-    if source in ("all", "discover"):
-        try:
-            web = _get_web_client(session_cookie)
-            discover = await web.discover_events(
-                geo_region_slug=city,
-                category=category,
-                after=after_dt,
-                before=before_dt,
-            )
-            event_lists.append(discover)
-        except Exception as e:
-            messages.append(f"Discover source error: {e}")
+    # Infer city from address coordinates when not explicitly set
+    if not city and resolved_lat is not None and resolved_lon is not None:
+        city = _nearest_city(resolved_lat, resolved_lon)
 
-    if want_subscribed and session_cookie:
+    # Discover
+    try:
+        web = _get_web_client(session_cookie)
+        discover = await web.discover_events(
+            geo_region_slug=city,
+            category=category,
+            after=after_dt,
+            before=before_dt,
+        )
+        event_lists.append(discover)
+    except Exception as e:
+        messages.append(f"Discover source error: {e}")
+
+    # Subscribed calendars (only if logged in)
+    if session_cookie:
         try:
             web = _get_web_client(session_cookie)
             subscribed = await web.subscribed_calendar_events()
@@ -402,8 +462,8 @@ async def search_events(
             exclude_unknown_location=exclude_unknown_location,
         )
 
-    if kw:
-        events = filter_by_keywords(events, kw)
+    if keywords:
+        events = filter_by_keywords(events, keywords)
 
     if latin_only:
         events = [e for e in events if _is_latin_event(e)]
@@ -523,6 +583,22 @@ def _local_dt(dt: datetime, tz_name: Optional[str]) -> str:
     return dt.isoformat()
 
 
+_STATE_ZIP_RE = re.compile(r"^[A-Z]{2}\s+\d{4,5}")
+
+
+def _extract_city(full_address: Optional[str]) -> Optional[str]:
+    """Pull the city name from a full address string like '123 Main St, Palo Alto, CA 94301'."""
+    if not full_address:
+        return None
+    parts = [p.strip() for p in full_address.split(",")]
+    if len(parts) < 3:
+        return None
+    for i in range(1, len(parts)):
+        if _STATE_ZIP_RE.match(parts[i]):
+            return parts[i - 1]
+    return parts[-2]
+
+
 def _event_summary(event: LumaEvent) -> dict:
     return {
         "id": event.id,
@@ -530,6 +606,7 @@ def _event_summary(event: LumaEvent) -> dict:
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
+        "city": _extract_city(event.full_address),
         "location": event.location_label,
         "full_address": event.full_address,
         "distance_miles": event.distance_miles,
@@ -546,6 +623,7 @@ def _event_detail(event: LumaEvent) -> dict:
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
+        "city": _extract_city(event.full_address),
         "lat": event.lat,
         "lon": event.lon,
         "location_label": event.location_label,

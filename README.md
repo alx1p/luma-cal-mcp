@@ -6,8 +6,9 @@ A [FastMCP](https://gofastmcp.com) server that discovers events from [Luma](http
 
 | Tool | What it does |
 |------|-------------|
-| `search_events` | Unified search across Discover and subscribed calendars. Filter by city/region, category, distance from a point (coordinates or address), keywords, and recency (`added_within_days`, `new_only`). Handles login and default-preference setup automatically. Event times are returned in each event's local timezone. |
-| `get_event` | Fetch full details for a single event by API id or `lu.ma` URL. Includes RSVP link. |
+| `search_events` | Search Discover and subscribed calendars. Filter by city, category, distance from address, keywords, date range, and recency. Event times in local timezone. |
+| `set_preferences` | Save default city, address, distance, and category. Persists in SQLite across restarts. |
+| `get_event` | Fetch full details for a single event by API id or `lu.ma` URL. |
 | `export_event_ics` | Generate an ICS string for any event — paste into Apple Calendar, Google Calendar, Outlook, etc. |
 
 ## Setup
@@ -36,23 +37,25 @@ uv pip install -e ".[auth]"
 playwright install chromium
 ```
 
-On first use, `search_events` walks you through setup one step at a time:
+### First run
 
-1. **Login prompt** — asks whether to log in for subscribed calendars. The session cookie is stored locally in SQLite and re-validated automatically.
-2. **Defaults prompt** — asks for preferred address, city, category, and distance. Stored in SQLite and used on subsequent calls.
+On first use, the server walks you through setup one step at a time:
 
-Each prompt appears once per call, so the agent handles them sequentially rather than all at once.
+1. **Login** — asks whether to log in for subscribed calendars.
+2. **Location** — asks where to search (city or address). No events are returned until a location is configured via `set_preferences`.
+
+Each prompt appears once per call, so the agent handles them sequentially.
 
 ### Configure
 
-Defaults are set at runtime via `search_events` parameters and persist across restarts:
+Use `set_preferences` to save defaults that persist across restarts:
 
-- `set_default_address="3180 18th St, San Francisco"` — your home location for distance filtering.
-- `set_default_category="ai"` — event type to browse by default.
-- `set_default_city="sf-bay-area"` — Discover region.
-- `set_default_max_distance=15` — radius in miles.
+```
+set_preferences(address="3180 18th St, San Francisco", max_distance_miles=15)
+set_preferences(category="ai")
+```
 
-Env vars (see `.env.example`) are also supported as fallbacks.
+When you provide an address without a city, the nearest Luma region is inferred automatically. You can also set `city` explicitly (e.g. `city="sf-bay-area"`).
 
 ### Run
 
@@ -66,17 +69,15 @@ python -m luma_mcp.server
 
 ## Authentication
 
-Subscribed calendars require a Luma session cookie. The server handles this automatically via an inline login flow — no manual cookie extraction or environment variables needed.
+Subscribed calendars require a Luma session cookie. The server handles this automatically via an inline login flow.
 
 **How it works:**
 
-1. **First call** — the login prompt is the first setup question. The agent relays it in chat.
-2. **Login** — call `search_events` with `login=true`. A Chromium browser opens to `lu.ma/signin`; log in normally. The session cookie is captured and stored in the local SQLite DB.
-3. **Decline** — call `search_events` with `skip_login_days=N` to defer (0 = ask next time, -1 = never).
-4. **Returning user, cookie expired** — the browser opens automatically for re-authentication (you opted in by logging in previously).
-5. **Validation** — the stored cookie is validated against Luma's API every 24 hours. If it expires, the server re-opens the browser.
-
-**Agent parameter:** `no_login=true` skips subscribed calendars for a single call without changing stored preferences.
+1. **First call** — the server prompts for login. The agent asks you in chat.
+2. **Login** — the agent calls `search_events` with `login=true`. A Chromium browser opens to `lu.ma/signin`; log in normally. The session cookie is stored in the local SQLite DB.
+3. **Decline** — the agent calls `search_events` with `skip_login_days=N` to defer (0 = ask next time, -1 = never).
+4. **Returning user, cookie expired** — the browser opens automatically for re-authentication.
+5. **Validation** — the stored cookie is validated against Luma's API every 24 hours.
 
 ## New Event Tracking
 
@@ -122,9 +123,9 @@ Without logging in, the server still works — Discover is fully available with 
 
 ## Distance Filtering
 
-Provide a center point as coordinates (`center_lat` + `center_lon`) or a street address (`center_address`), plus `max_distance_miles`. Events beyond the radius are excluded. Events without location data are included by default (with `distance_miles: null`), or excluded if `exclude_unknown_location` is set.
+Provide a street address via `set_preferences(address="...")` or as `center_address` on `search_events`, plus `max_distance_miles`. Events beyond the radius are excluded. Events without location data are included by default (with `distance_miles: null`), or excluded if `exclude_unknown_location` is set.
 
-Geocoding uses [Nominatim](https://nominatim.org/) (free, OpenStreetMap) by default. For higher volume, set `GEOCODING_PROVIDER=google` or `mapbox` with the corresponding `GEOCODING_API_KEY`.
+Geocoding uses [Nominatim](https://nominatim.org/) (free, OpenStreetMap) by default. For higher volume, set `GEOCODING_PROVIDER=google` or `mapbox` with the corresponding `GEOCODING_API_KEY` in your environment.
 
 ## Event Times
 
