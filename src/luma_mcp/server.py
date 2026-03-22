@@ -600,19 +600,19 @@ def _extract_city(full_address: Optional[str]) -> Optional[str]:
 
 
 def _event_summary(event: LumaEvent) -> dict:
-    return {
+    d: dict = {
         "id": event.id,
         "title": event.title,
         "start_at": _local_dt(event.start_at, event.timezone),
         "end_at": _local_dt(event.end_at, event.timezone) if event.end_at else None,
         "timezone": event.timezone,
         "city": _extract_city(event.full_address),
-        "location": event.location_label,
-        "full_address": event.full_address,
-        "distance_miles": event.distance_miles,
+        "venue": event.location_label,
         "url": event.canonical_url,
-        "source": event.source.value,
     }
+    if event.distance_miles is not None:
+        d["distance_miles"] = event.distance_miles
+    return d
 
 
 def _event_detail(event: LumaEvent) -> dict:
