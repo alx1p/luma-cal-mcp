@@ -190,9 +190,13 @@ class LumaWebClient:
         event_data = data.get("event", {})
         if not event_data:
             return None
+
+        description = _extract_description_mirror(data.get("description_mirror"))
+
         return _parse_web_event(
             {"event": event_data, "api_id": data.get("api_id", event_data.get("api_id", ""))},
             source=EventSource.DISCOVER,
+            description_override=description,
         )
 
     async def close(self) -> None:
@@ -211,7 +215,28 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt
 
 
-def _parse_web_event(entry: dict, *, source: EventSource) -> Optional[LumaEvent]:
+def _extract_description_mirror(node: dict | list | None) -> str:
+    """Extract plain text from a ProseMirror description_mirror document."""
+    if not node:
+        return ""
+    parts: list[str] = []
+    if isinstance(node, dict):
+        if node.get("type") == "text":
+            parts.append(node.get("text", ""))
+        for child in node.get("content", []):
+            parts.append(_extract_description_mirror(child))
+    elif isinstance(node, list):
+        for item in node:
+            parts.append(_extract_description_mirror(item))
+    return " ".join(p for p in parts if p).strip()
+
+
+def _parse_web_event(
+    entry: dict,
+    *,
+    source: EventSource,
+    description_override: str = "",
+) -> Optional[LumaEvent]:
     ev = entry.get("event", {})
     if not ev:
         return None
@@ -225,12 +250,19 @@ def _parse_web_event(entry: dict, *, source: EventSource) -> Optional[LumaEvent]
 
     url_slug = ev.get("url", "")
 
+    description = (
+        description_override
+        or ev.get("description")
+        or ev.get("description_md")
+        or ""
+    )
+
     return LumaEvent(
         id=api_id,
         url=url_slug,
         source=source,
         title=ev.get("name", ""),
-        description=ev.get("description") or ev.get("description_md") or "",
+        description=description,
         start_at=ev["start_at"],
         end_at=ev.get("end_at"),
         timezone=ev.get("timezone"),

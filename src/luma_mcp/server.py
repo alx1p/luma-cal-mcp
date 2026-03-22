@@ -75,36 +75,45 @@ def _resolve_defaults(
     city: Optional[str],
     category: Optional[str],
     center_address: Optional[str],
+    max_distance_miles: Optional[float],
     set_default_city: Optional[str],
     set_default_category: Optional[str],
     set_default_address: Optional[str],
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Resolve city/category/address with precedence: param > DB > env.
+    set_default_max_distance: Optional[float],
+    skip_defaults: bool,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[float]]:
+    """Resolve city/category/address/distance with precedence: param > DB > env.
 
-    Persists any set_default_* values. On first run, always prompts to save
-    defaults — even when explicit values are passed.
+    Persists any set_default_* values. Keeps prompting to save defaults
+    until at least one is stored or the user declines.
+
+    Returns (city, category, address, max_distance_miles).
     """
+    if skip_defaults:
+        store.set_setting("defaults_declined", "true")
+
     if set_default_city is not None:
         store.set_setting("default_city", set_default_city)
     if set_default_category is not None:
         store.set_setting("default_category", set_default_category)
     if set_default_address is not None:
         store.set_setting("default_center_address", set_default_address)
+    if set_default_max_distance is not None:
+        store.set_setting("default_max_distance_miles", str(set_default_max_distance))
 
     stored_city = _stored_default(store, "default_city")
     stored_category = _stored_default(store, "default_category")
     stored_address = _stored_default(store, "default_center_address")
+    stored_distance = _stored_default(store, "default_max_distance_miles")
 
     eff_city = city or stored_city or cfg.default_city
     eff_category = category or stored_category or cfg.default_category
     eff_address = center_address or stored_address or cfg.default_center_address
+    eff_distance = max_distance_miles or (float(stored_distance) if stored_distance else None) or cfg.default_max_distance_miles
 
-    has_stored = stored_city or stored_category or stored_address
-    already_prompted = _stored_default(store, "preferences_prompted")
-    if not has_stored and not already_prompted:
-        store.set_setting("preferences_prompted", "true")
-
-        # Suggest saving explicitly-passed values
+    has_stored = stored_city or stored_category or stored_address or stored_distance
+    declined = _stored_default(store, "defaults_declined")
+    if not has_stored and not declined:
         save_hints: list[str] = []
         if city and not stored_city:
             save_hints.append(f'  set_default_city="{city}"')
@@ -112,39 +121,29 @@ def _resolve_defaults(
             save_hints.append(f'  set_default_address="{center_address}"')
         if category and not stored_category:
             save_hints.append(f'  set_default_category="{category}"')
+        if max_distance_miles and not stored_distance:
+            save_hints.append(f'  set_default_max_distance={max_distance_miles}')
 
+        decline_hint = "\n\nOr skip_defaults=true to stop asking."
         if save_hints:
             messages.append(
                 "Want to save these as your defaults for future searches? "
                 "Call search_events with:\n"
                 + "\n".join(save_hints)
-                + "\n\nYou can also set any you didn't pass:\n"
-                "  set_default_address=\"your address\"\n"
-                "  set_default_category=\"ai\" (or tech, crypto, food-drink, etc.)\n"
-                "  set_default_city=\"sf-bay-area\" (or new-york, los-angeles, etc.)"
+                + decline_hint
             )
         else:
             messages.append(
-                "No default location or event type configured. "
+                "No default preferences configured. "
                 "You can set persistent defaults by calling search_events with:\n"
-                "  set_default_address=\"your address\"\n"
-                "  set_default_category=\"ai\" (or tech, crypto, food-drink, etc.)\n"
-                "  set_default_city=\"sf-bay-area\" (or new-york, los-angeles, etc.)\n\n"
-                "These are saved locally and used on future calls when you don't pass them explicitly."
+                '  set_default_address="your address"\n'
+                '  set_default_category="ai" (or tech, crypto, food-drink, etc.)\n'
+                '  set_default_city="sf-bay-area" (or new-york, los-angeles, etc.)\n'
+                "  set_default_max_distance=15"
+                + decline_hint
             )
 
-        # Also prompt for login on first run
-        had_cookie = _stored_default(store, "luma_login_had_cookie")
-        declined = _stored_default(store, "luma_login_declined_until")
-        if not had_cookie and not declined:
-            messages.append(
-                "Would you like to log in to Luma to also see events from your "
-                "subscribed calendars? (Y/n)\n\n"
-                "Call search_events with login=true to log in, or "
-                "skip_login_days=N to decline (0 = ask next time, -1 = never ask again)."
-            )
-
-    return eff_city, eff_category, eff_address
+    return eff_city, eff_category, eff_address, eff_distance
 
 
 # --------------------------------------------------------------------------
@@ -289,6 +288,8 @@ async def search_events(
     set_default_address: Optional[str] = None,
     set_default_category: Optional[str] = None,
     set_default_city: Optional[str] = None,
+    set_default_max_distance: Optional[float] = None,
+    skip_defaults: bool = False,
 ) -> dict:
     """Search for Luma events from Discover and/or subscribed calendars.
 
@@ -302,7 +303,7 @@ async def search_events(
         center_lat: Latitude of the center point for distance filtering.
         center_lon: Longitude of the center point for distance filtering.
         center_address: Street address to geocode as the center point (used if lat/lon not provided). Falls back to stored default, then DEFAULT_CENTER_ADDRESS env.
-        max_distance_miles: Maximum distance in miles from the center. Events beyond this are excluded.
+        max_distance_miles: Maximum distance in miles from the center. Falls back to stored default, then DEFAULT_MAX_DISTANCE_MILES env.
         keywords: List of keywords to filter by (matches title/description). Empty list means no keyword filter.
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
@@ -316,6 +317,8 @@ async def search_events(
         set_default_address: Persist a default center address for future calls.
         set_default_category: Persist a default category for future calls.
         set_default_city: Persist a default city/region slug for future calls.
+        set_default_max_distance: Persist a default max distance in miles for future calls.
+        skip_defaults: If true, stop asking to save default preferences.
     """
     cfg = _get_config()
     source = source or "all"
@@ -326,12 +329,15 @@ async def search_events(
 
     store = _get_event_store()
 
-    city, category, center_address = _resolve_defaults(
+    city, category, center_address, max_dist = _resolve_defaults(
         store, cfg, messages,
         city=city, category=category, center_address=center_address,
+        max_distance_miles=max_distance_miles,
         set_default_city=set_default_city,
         set_default_category=set_default_category,
         set_default_address=set_default_address,
+        set_default_max_distance=set_default_max_distance,
+        skip_defaults=skip_defaults,
     )
 
     after_dt = _parse_dt(after)
@@ -343,7 +349,6 @@ async def search_events(
         center_address,
         geocode_fn=_geocode_fn,
     )
-    max_dist = max_distance_miles or cfg.default_max_distance_miles
 
     # Resolve session cookie for subscribed calendars
     session_cookie: Optional[str] = None
@@ -395,7 +400,7 @@ async def search_events(
         events = filter_by_keywords(events, kw)
 
     if latin_only:
-        events = [e for e in events if _is_latin_text(f"{e.title} {e.description}")]
+        events = [e for e in events if _is_latin_event(e)]
 
     events.sort(key=lambda e: e.start_at)
 
@@ -545,13 +550,35 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
     return dt
 
 
-def _is_latin_text(text: str) -> bool:
-    """Return True if the majority of alphabetic characters are Latin-script."""
+def _latin_ratio(text: str) -> float:
+    """Return the fraction of alphabetic characters that are Latin-script."""
     alpha = [c for c in text if c.isalpha()]
     if not alpha:
-        return True
-    latin = sum(1 for c in alpha if c < "\u0250")
-    return latin / len(alpha) > 0.5
+        return 1.0
+    return sum(1 for c in alpha if c < "\u0250") / len(alpha)
+
+
+def _has_cjk(text: str) -> bool:
+    """Return True if text contains any CJK Unified Ideograph characters."""
+    return any("\u4e00" <= c <= "\u9fff" for c in text)
+
+
+def _is_latin_event(event: LumaEvent) -> bool:
+    """Return True if an event appears to be in a Latin-script language.
+
+    Checks title at a strict threshold (brand names like 'OpenAI' inflate
+    Latin counts in otherwise non-Latin titles). If a description exists,
+    it's checked separately — a non-Latin description filters the event
+    even when the title looks Latin. Titles containing CJK characters
+    require a higher ratio to pass.
+    """
+    title_ratio = _latin_ratio(event.title)
+    title_threshold = 0.9 if _has_cjk(event.title) else 0.8
+    if title_ratio < title_threshold:
+        return False
+    if event.description and _latin_ratio(event.description) < 0.5:
+        return False
+    return True
 
 
 def _extract_event_id_from_url(url: str) -> str:
