@@ -14,7 +14,7 @@ import httpx
 
 from luma_mcp.models import EventSource, LumaEvent
 
-_DEFAULT_WINDOW_DAYS = 30
+_DEFAULT_WINDOW_DAYS = 14
 _MAX_PAGES = 40
 _PAGE_SIZE = 50
 

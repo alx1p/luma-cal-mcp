@@ -308,6 +308,7 @@ async def search_events(
     max_distance_miles: Optional[float] = None,
     after: Optional[str] = None,
     before: Optional[str] = None,
+    days: Optional[int] = None,
     latin_only: Optional[bool] = None,
     added_within_days: Optional[float] = None,
     new_only: bool = False,
@@ -324,6 +325,10 @@ async def search_events(
 
     **Travel mode** (`city` set): fetches the curated top events (~20-40) for
     that city via Luma's Place API. No topic filtering — just the highlights.
+
+    The default time window is the next 2 weeks. Use `days` for simple
+    lookahead (e.g. days=7 for this week, days=30 for next month).
+    Use `after`/`before` only for specific date ranges.
 
     IMPORTANT for agents:
     - For broad topics, prefer `category` (exact slug: tech, ai, food, arts,
@@ -344,6 +349,7 @@ async def search_events(
         max_distance_miles: One-off distance override for home mode.
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
+        days: Search window in days from now (e.g. 7, 30). Overrides the default 14-day window. Simpler alternative to after/before.
         latin_only: Filter out non-Latin-script events. Auto-detected from region when not set.
         added_within_days: Only return events first seen within this many days.
         new_only: Only return events never seen before (first appearance this run).
@@ -366,6 +372,8 @@ async def search_events(
 
     after_dt = _parse_dt(after)
     before_dt = _parse_dt(before)
+    if days is not None and before_dt is None:
+        before_dt = datetime.now(tz=timezone.utc) + timedelta(days=days)
 
     # ------------------------------------------------------------------
     # Travel mode (city is set)
