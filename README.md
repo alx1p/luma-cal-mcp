@@ -48,7 +48,7 @@ cp .env.example .env
 
 **No env vars are required.** Discover and event lookup work out of the box, with no API key and no account.
 
-**Optional (enhance functionality):**
+**Optional env vars (enhance functionality):**
 - `DEFAULT_CITY` — Discover region slug (e.g. `sf-bay-area`, `new-york`, `los-angeles`).
 - `DEFAULT_CATEGORY` — category filter (e.g. `ai`, `tech`, `crypto`, `food-drink`).
 - `DEFAULT_CENTER_LAT`, `DEFAULT_CENTER_LON` — default center point for distance filtering.
@@ -57,7 +57,17 @@ cp .env.example .env
 - `DEFAULT_KEYWORDS` — comma-separated keyword list.
 - `GEOCODING_PROVIDER` — `nominatim` (default, free), `google`, or `mapbox`.
 - `GEOCODING_API_KEY` — required for Google or Mapbox geocoding.
-- `EVENT_STORE_PATH` — path to the SQLite DB that tracks first-seen timestamps and login state. Default: `~/.luma-mcp/events.db`.
+- `EVENT_STORE_PATH` — path to the SQLite DB that tracks first-seen timestamps, login state, and saved preferences. Default: `~/.luma-mcp/events.db`.
+
+#### Persistent preferences
+
+You can also set defaults at runtime via `search_events` parameters. These are stored in the local SQLite DB and persist across restarts — no `.env` editing needed:
+
+- `set_default_address="3180 18th St, San Francisco"` — your home location for distance filtering.
+- `set_default_category="ai"` — event type to browse by default.
+- `set_default_city="sf-bay-area"` — Discover region.
+
+Precedence: explicit call parameter > stored DB preference > env var. On first run with no defaults configured anywhere, the server prompts you to set these.
 
 ### Run
 

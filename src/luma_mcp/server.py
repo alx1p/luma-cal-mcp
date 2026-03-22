@@ -62,6 +62,59 @@ def _geocode_fn(address: str) -> tuple[Optional[float], Optional[float]]:
     return geocode(address, provider=cfg.geocoding_provider, api_key=cfg.geocoding_api_key)
 
 
+def _stored_default(store: EventStore, key: str) -> Optional[str]:
+    row = store.get_setting(key)
+    return row[0] if row else None
+
+
+def _resolve_defaults(
+    store: EventStore,
+    cfg: Config,
+    messages: list[str],
+    *,
+    city: Optional[str],
+    category: Optional[str],
+    center_address: Optional[str],
+    set_default_city: Optional[str],
+    set_default_category: Optional[str],
+    set_default_address: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve city/category/address with precedence: param > DB > env.
+
+    Persists any set_default_* values and prompts on first run if no defaults exist.
+    """
+    if set_default_city is not None:
+        store.set_setting("default_city", set_default_city)
+    if set_default_category is not None:
+        store.set_setting("default_category", set_default_category)
+    if set_default_address is not None:
+        store.set_setting("default_center_address", set_default_address)
+
+    eff_city = city or _stored_default(store, "default_city") or cfg.default_city
+    eff_category = category or _stored_default(store, "default_category") or cfg.default_category
+    eff_address = (
+        center_address
+        or _stored_default(store, "default_center_address")
+        or cfg.default_center_address
+    )
+
+    # First-run prompt when nothing is configured
+    has_any = eff_city or eff_category or eff_address
+    already_prompted = _stored_default(store, "preferences_prompted")
+    if not has_any and not already_prompted:
+        store.set_setting("preferences_prompted", "true")
+        messages.append(
+            "No default location or event type configured. "
+            "You can set persistent defaults by calling search_events with:\n"
+            "  set_default_address=\"your address\"\n"
+            "  set_default_category=\"ai\" (or tech, crypto, food-drink, etc.)\n"
+            "  set_default_city=\"sf-bay-area\" (or new-york, los-angeles, etc.)\n\n"
+            "These are saved locally and used on future calls when you don't pass them explicitly."
+        )
+
+    return eff_city, eff_category, eff_address
+
+
 # --------------------------------------------------------------------------
 # Session management helpers
 # --------------------------------------------------------------------------
@@ -200,6 +253,9 @@ async def search_events(
     login: bool = False,
     skip_login_days: Optional[int] = None,
     no_login: bool = False,
+    set_default_address: Optional[str] = None,
+    set_default_category: Optional[str] = None,
+    set_default_city: Optional[str] = None,
 ) -> dict:
     """Search for Luma events from Discover and/or subscribed calendars.
 
@@ -207,12 +263,12 @@ async def search_events(
     point (coordinates or geocoded address) and optional keywords.
 
     Args:
-        city: Discover region slug (e.g. "sf-bay-area", "new-york"). Falls back to DEFAULT_CITY env.
-        category: Discover category filter (e.g. "ai", "tech", "crypto"). Falls back to DEFAULT_CATEGORY env.
+        city: Discover region slug (e.g. "sf-bay-area", "new-york"). Falls back to stored default, then DEFAULT_CITY env.
+        category: Discover category filter (e.g. "ai", "tech", "crypto"). Falls back to stored default, then DEFAULT_CATEGORY env.
         source: Which sources to query: "discover", "subscribed", or "all" (default).
         center_lat: Latitude of the center point for distance filtering.
         center_lon: Longitude of the center point for distance filtering.
-        center_address: Street address to geocode as the center point (used if lat/lon not provided).
+        center_address: Street address to geocode as the center point (used if lat/lon not provided). Falls back to stored default, then DEFAULT_CENTER_ADDRESS env.
         max_distance_miles: Maximum distance in miles from the center. Events beyond this are excluded.
         keywords: List of keywords to filter by (matches title/description). Empty list means no keyword filter.
         after: ISO 8601 datetime — only events starting after this time.
@@ -223,12 +279,26 @@ async def search_events(
         login: Set to true to open a browser and log in to Luma for subscribed calendar access.
         skip_login_days: Decline Luma login for N days. 0 = ask next time, -1 = never ask again.
         no_login: If true, skip subscribed calendars for this call without changing stored preferences.
+        set_default_address: Persist a default center address for future calls.
+        set_default_category: Persist a default category for future calls.
+        set_default_city: Persist a default city/region slug for future calls.
     """
     cfg = _get_config()
-    city = city or cfg.default_city
-    category = category or cfg.default_category
     source = source or "all"
     kw = keywords if keywords is not None else cfg.default_keywords
+
+    event_lists: list[list[LumaEvent]] = []
+    messages: list[str] = []
+
+    store = _get_event_store()
+
+    city, category, center_address = _resolve_defaults(
+        store, cfg, messages,
+        city=city, category=category, center_address=center_address,
+        set_default_city=set_default_city,
+        set_default_category=set_default_category,
+        set_default_address=set_default_address,
+    )
 
     after_dt = datetime.fromisoformat(after) if after else None
     before_dt = datetime.fromisoformat(before) if before else None
@@ -236,15 +306,10 @@ async def search_events(
     resolved_lat, resolved_lon = resolve_center(
         center_lat or cfg.default_center_lat,
         center_lon or cfg.default_center_lon,
-        center_address or cfg.default_center_address,
+        center_address,
         geocode_fn=_geocode_fn,
     )
     max_dist = max_distance_miles or cfg.default_max_distance_miles
-
-    event_lists: list[list[LumaEvent]] = []
-    messages: list[str] = []
-
-    store = _get_event_store()
 
     # Resolve session cookie for subscribed calendars
     session_cookie: Optional[str] = None
