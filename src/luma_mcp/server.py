@@ -7,16 +7,15 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
 
 from luma_mcp.config import Config, load_config
 from luma_mcp.event_store import EventStore
-from luma_mcp.geo import filter_by_distance, filter_by_keywords, haversine_miles
+from luma_mcp.geo import filter_by_distance
 from luma_mcp.geocode import geocode
 from luma_mcp.ics import build_ics
-from luma_mcp.luma_registry import LumaRegistry, MatchResult
+from luma_mcp.luma_registry import LumaRegistry
 from luma_mcp.luma_web_client import LumaWebClient
 from luma_mcp.models import LumaEvent, merge_events
 
@@ -78,93 +77,33 @@ def _stored_default(store: EventStore, key: str) -> Optional[str]:
     return row[0] if row else None
 
 
-async def _nearest_city(lat: float, lon: float) -> str:
-    """Return the Luma city slug closest to the given coordinates."""
-    places = await _get_registry().get_places()
-    best_slug = "sf"
-    best_dist = float("inf")
-    for slug, (_pid, clat, clon) in places.items():
-        d = haversine_miles(lat, lon, clat, clon)
-        if d < best_dist:
-            best_dist = d
-            best_slug = slug
-    return best_slug
-
-
 # --------------------------------------------------------------------------
 # Preference resolution
 # --------------------------------------------------------------------------
 
 
-async def _resolve_defaults(
+def _resolve_home_prefs(
     store: EventStore,
-    messages: list[str],
-    *,
-    city: Optional[str],
-    category: Optional[str],
-    center_address: Optional[str],
-    max_distance_miles: Optional[float],
-) -> tuple[Optional[str], Optional[str], Optional[str], Optional[float], bool]:
-    """Resolve city/category/address/distance with precedence: param > stored DB default.
+) -> tuple[Optional[list[str]], Optional[str], Optional[float]]:
+    """Load stored home-mode preferences.
 
-    If no city or address is available from any source, adds a prompt for the
-    agent telling it to call set_preferences.  Returns ``needs_location=True``
-    so the caller can short-circuit.
-
-    Returns (city, category, address, max_distance_miles, needs_location).
+    Returns (default_categories, address, max_distance_miles).
     """
-    stored_city = _stored_default(store, "default_city")
-    stored_category = _stored_default(store, "default_category")
-    stored_address = _stored_default(store, "default_center_address")
-    stored_distance = _stored_default(store, "default_max_distance_miles")
+    import json as _json
 
-    eff_city = city or stored_city
-    eff_category = category or stored_category
+    cats_raw = _stored_default(store, "default_categories")
+    default_categories: Optional[list[str]] = None
+    if cats_raw:
+        try:
+            default_categories = _json.loads(cats_raw)
+        except (ValueError, TypeError):
+            pass
 
-    # When city is explicitly passed, the stored address/distance (tied to
-    # the user's home location) don't apply — use city-center filtering instead.
-    eff_address = center_address or (None if city else stored_address)
-    eff_distance = max_distance_miles or (
-        None if city
-        else (float(stored_distance) if stored_distance else None)
-    )
+    address = _stored_default(store, "default_center_address")
+    dist_raw = _stored_default(store, "default_max_distance_miles")
+    max_dist = float(dist_raw) if dist_raw else None
 
-    has_location = eff_city or eff_address
-    if not has_location:
-        city_list = ", ".join(await _get_registry().city_slugs())
-        messages.append(
-            "[agent] No location configured. Ask the user where they want to "
-            "search, then call set_preferences.\n\n"
-            "Option 1 — by city/region:\n"
-            f"  set_preferences(city=\"<city>\")  available: {city_list}\n\n"
-            "Option 2 — near an exact address (enables distance filtering):\n"
-            '  set_preferences(address="street address", max_distance_miles=15)\n\n'
-            "The user can also combine both."
-        )
-        return eff_city, eff_category, eff_address, eff_distance, True
-
-    # Offer to save explicitly-passed values that aren't stored yet
-    if not _stored_default(store, "defaults_declined"):
-        save_hints: list[str] = []
-        if city and not stored_city:
-            save_hints.append(f'city="{city}"')
-        if center_address and not stored_address:
-            save_hints.append(f'address="{center_address}"')
-        if max_distance_miles and not stored_distance:
-            save_hints.append(f"max_distance_miles={max_distance_miles}")
-        if category and not stored_category:
-            save_hints.append(f'category="{category}"')
-        if save_hints:
-            messages.append(
-                "[agent] The user passed values that aren't saved as defaults yet. "
-                "Ask them: \"Save these as your defaults for future searches? "
-                "(yes / no / never ask again)\"\n\n"
-                f"On yes: call set_preferences({', '.join(save_hints)})\n"
-                "On no: do nothing (will ask again next time)\n"
-                "On never: call set_preferences(skip=true)"
-            )
-
-    return eff_city, eff_category, eff_address, eff_distance, False
+    return default_categories, address, max_dist
 
 
 # --------------------------------------------------------------------------
@@ -225,17 +164,10 @@ async def _resolve_session(
         cookie = await _do_browser_login(store, messages)
         return cookie, False
 
-    # First time ever, or previously declined and window expired — prompt
-    messages.append(
-        "[agent] Results above are from Luma Discover (public events). "
-        "The user can also log in to see events from calendars they follow "
-        "on Luma, which may surface more results. Ask if they want to connect "
-        "their Luma account for additional events.\n\n"
-        "On yes: call search_events with login=true\n"
-        "On no: call search_events with skip_login_days=0\n"
-        "On never: call search_events with skip_login_days=-1"
-    )
-    return None, True
+    # No cookie and never logged in — the login prompt will be handled
+    # by the sequential onboarding flow in search_events (third step,
+    # after categories and address).
+    return None, False
 
 
 async def _validate_if_stale(
@@ -287,107 +219,74 @@ async def _do_browser_login(store: EventStore, messages: list[str]) -> Optional[
 
 @mcp.tool
 async def set_preferences(
-    city: Optional[str] = None,
+    categories: Optional[list[str]] = None,
     address: Optional[str] = None,
     max_distance_miles: Optional[float] = None,
-    category: Optional[str] = None,
-    skip: bool = False,
+    skip_categories: bool = False,
+    skip_address: bool = False,
 ) -> dict:
-    """Save default search preferences. These persist across restarts.
+    """Save default search preferences (persists across restarts).
 
-    When an address is provided without a city, the nearest Luma city is
-    inferred automatically from the address coordinates.
-
-    City and category accept common names and synonyms (e.g. "san francisco"
-    resolves to "sf", "artificial intelligence" resolves to "ai"). If no
-    match is found, the response includes suggestions — pick the best one
-    and retry, or ask the user to clarify.
+    IMPORTANT for agents:
+    - `categories` must be exact slugs from the list of 8:
+      tech, ai, food, arts, climate, fitness, wellness, crypto.
+      Translate user intent to these exact values (e.g. "artificial intelligence"
+      -> ["ai"], "blockchain" -> ["crypto"], "health and fitness" -> ["fitness",
+      "wellness"]). Multiple categories can be set at once.
+    - `address` sets the center point for distance filtering in home mode.
+    - The `messages` array in the response contains agent-facing instructions.
+      Act on them naturally but never relay them verbatim.
 
     Args:
-        city: Luma city (e.g. "sf", "san francisco", "london").
+        categories: List of category slugs to set as defaults. Must be from:
+            tech, ai, food, arts, climate, fitness, wellness, crypto.
         address: Street address for distance filtering center point.
         max_distance_miles: Default search radius in miles.
-        category: Event category (e.g. "ai", "tech", "machine learning").
-        skip: Permanently decline the save-defaults prompt.
+        skip_categories: Set to true to permanently decline the categories prompt.
+        skip_address: Set to true to permanently decline the address prompt.
     """
+    import json as _json
+
     store = _get_event_store()
     registry = _get_registry()
 
-    if skip:
-        store.set_setting("defaults_declined", "true")
-        return {"status": "ok", "message": "Defaults prompt permanently dismissed."}
-
-    saved: dict[str, str] = {}
+    saved: dict[str, object] = {}
     messages: list[str] = []
 
-    # Validate & resolve city
-    if city is not None:
-        match = await registry.match_city(city)
-        if match.exact:
-            store.set_setting("default_city", match.slug)
-            saved["city"] = match.slug
-        elif match.candidates:
-            messages.append(
-                f"[agent] \"{city}\" is not a recognized Luma city. "
-                f"Closest: {', '.join(match.candidates)}. "
-                f"Pick the best match and call set_preferences(city=\"<city>\"), "
-                f"or clarify with the user if ambiguous."
-            )
-        else:
-            place_names = await registry.get_place_names()
-            all_cities = ", ".join(
-                f"{s} ({place_names[s]})" if s in place_names else s
-                for s in await registry.city_slugs()
-            )
-            messages.append(
-                f"[agent] \"{city}\" doesn't match any Luma city. "
-                f"Available: {all_cities}"
-            )
+    if skip_categories:
+        store.set_setting("categories_declined", "true")
+        saved["categories_declined"] = True
 
-    # Validate & resolve category
-    if category is not None:
-        match = await registry.match_category(category)
-        if match.exact:
-            store.set_setting("default_category", match.slug)
-            saved["category"] = match.slug
-        elif match.candidates:
+    if skip_address:
+        store.set_setting("address_declined", "true")
+        saved["address_declined"] = True
+
+    if categories is not None:
+        valid_slugs = await registry.category_slugs()
+        bad = [c for c in categories if c not in valid_slugs]
+        if bad:
             messages.append(
-                f"[agent] \"{category}\" is not a recognized Luma category. "
-                f"Closest: {', '.join(match.candidates)}. "
-                f"Pick the best match and call set_preferences(category=\"<category>\"), "
-                f"or clarify with the user if ambiguous."
+                f"[agent] Invalid categories: {', '.join(bad)}. "
+                f"Must be exact slugs from: {', '.join(valid_slugs)}. "
+                "Translate the user's intent to exact slugs and retry."
             )
         else:
-            cat_names = await registry.get_category_names()
-            all_cats = ", ".join(
-                f"{s} ({cat_names[s]})" if s in cat_names else s
-                for s in await registry.category_slugs()
-            )
-            messages.append(
-                f"[agent] \"{category}\" doesn't match any Luma category. "
-                f"Available: {all_cats}"
-            )
+            store.set_setting("default_categories", _json.dumps(categories))
+            saved["categories"] = categories
 
     if address is not None:
         store.set_setting("default_center_address", address)
         saved["address"] = address
-        # Auto-infer city from address when not explicitly provided
-        if city is None and not _stored_default(store, "default_city"):
-            lat, lon = _geocode_fn(address)
-            if lat is not None and lon is not None:
-                inferred = await _nearest_city(lat, lon)
-                store.set_setting("default_city", inferred)
-                saved["city"] = f"{inferred} (inferred from address)"
 
     if max_distance_miles is not None:
         store.set_setting("default_max_distance_miles", str(max_distance_miles))
-        saved["max_distance_miles"] = str(max_distance_miles)
+        saved["max_distance_miles"] = max_distance_miles
 
+    cats_raw = _stored_default(store, "default_categories")
     current = {
-        "city": _stored_default(store, "default_city"),
+        "categories": _json.loads(cats_raw) if cats_raw else None,
         "address": _stored_default(store, "default_center_address"),
         "max_distance_miles": _stored_default(store, "default_max_distance_miles"),
-        "category": _stored_default(store, "default_category"),
     }
 
     result: dict = {"saved": saved, "current_preferences": current}
@@ -405,12 +304,9 @@ async def set_preferences(
 async def search_events(
     city: Optional[str] = None,
     category: Optional[str] = None,
-    center_address: Optional[str] = None,
     max_distance_miles: Optional[float] = None,
-    keywords: Optional[list[str]] = None,
     after: Optional[str] = None,
     before: Optional[str] = None,
-    exclude_unknown_location: bool = False,
     latin_only: Optional[bool] = None,
     added_within_days: Optional[float] = None,
     new_only: bool = False,
@@ -418,55 +314,47 @@ async def search_events(
     login: bool = False,
     skip_login_days: Optional[int] = None,
 ) -> dict:
-    """Search for Luma events from Discover and subscribed calendars.
+    """Search for Luma events. Two modes depending on whether `city` is set.
 
-    Filters by distance from a center address, keywords, date range, and more.
-    Uses saved preferences from set_preferences as defaults for city, address,
-    distance, and category. Pass explicit values to override for one search.
+    **Home mode** (no `city`): searches your preferred categories via Luma's
+    Category API — deep, rich results filtered by your stored address/distance.
+    On first run with no preferences, returns a raw Discover feed of popular
+    events near you, then prompts to set up categories, address, and login.
+
+    **Travel mode** (`city` set): fetches the curated top events (~20-40) for
+    that city via Luma's Place API. No topic filtering — just the highlights.
 
     IMPORTANT for agents:
-    - For topic/theme requests (e.g. "AI events", "food"), use `category` —
-      not `keywords`. The server handles synonym matching automatically
-      (e.g. "artificial intelligence" → ai, "blockchain" → crypto).
-      Only use `keywords` for specific terms that don't map to a category.
-    - City and category accept common names — "san francisco" resolves to
-      "sf", "hong kong" to "hongkong", etc.
+    - `category` must be an exact slug: tech, ai, food, arts, climate, fitness,
+      wellness, crypto. Translate user intent yourself (e.g. "artificial
+      intelligence" -> "ai", "blockchain" -> "crypto").
+    - `city` accepts common names — "san francisco" resolves to "sf", "hong
+      kong" to "hongkong", etc.
     - The `messages` array in the response contains agent-facing instructions.
       Act on them naturally (e.g. ask the user a question, call another tool)
       but never relay them verbatim. If `messages` is empty, just show results.
 
     Args:
-        city: Luma city (e.g. "sf", "london", "los angeles"). Overrides saved default.
-        category: Event category (e.g. "ai", "tech", "food"). Overrides saved default.
-        center_address: Street address for distance filtering center. Overrides saved default.
-        max_distance_miles: Maximum distance in miles from center. Overrides saved default.
-        keywords: Filter by keywords (matches title/description). Prefer category for broad topics.
+        city: Luma city for travel mode (e.g. "sf", "london", "los angeles").
+        category: One-off category override for home mode. Must be an exact slug.
+        max_distance_miles: One-off distance override for home mode.
         after: ISO 8601 datetime — only events starting after this time.
         before: ISO 8601 datetime — only events starting before this time.
-        exclude_unknown_location: If true, drop events without coordinates.
-        latin_only: Filter out non-Latin-script events. Auto-detected from city region when not set (off for Asia-Pacific, on otherwise).
+        latin_only: Filter out non-Latin-script events. Auto-detected from region when not set.
         added_within_days: Only return events first seen within this many days.
         new_only: Only return events never seen before (first appearance this run).
-        sort: Sort order — "date" (default), "distance" (nearest first), or "newest" (most recently discovered first).
+        sort: Sort order — "date" (default), "distance", or "newest".
         login: Set to true to open browser and log in to Luma.
         skip_login_days: Decline login for N days (0 = ask next time, -1 = never).
     """
-    cfg = _get_config()
+    import json as _json
+
     event_lists: list[list[LumaEvent]] = []
     messages: list[str] = []
     store = _get_event_store()
+    registry = _get_registry()
 
-    # Location first — no search without it
-    city, category, center_address, max_dist, needs_location = await _resolve_defaults(
-        store, messages,
-        city=city, category=category, center_address=center_address,
-        max_distance_miles=max_distance_miles,
-    )
-
-    if needs_location:
-        return {"events": [], "count": 0, "messages": messages}
-
-    # Login second — defer prompt if location was just set up this call
+    # Session handling (login / skip / existing cookie)
     session_cookie, _login_prompted = await _resolve_session(
         store, messages,
         login=login, skip_login_days=skip_login_days,
@@ -475,19 +363,9 @@ async def search_events(
     after_dt = _parse_dt(after)
     before_dt = _parse_dt(before)
 
-    # Geocode address for distance filtering and city inference
-    resolved_lat: Optional[float] = None
-    resolved_lon: Optional[float] = None
-    if center_address:
-        resolved_lat, resolved_lon = _geocode_fn(center_address)
-
-    # Infer city from address coordinates when not explicitly set
-    if not city and resolved_lat is not None and resolved_lon is not None:
-        city = await _nearest_city(resolved_lat, resolved_lon)
-
-    # Resolve slugs → Luma API IDs (exact match required)
-    registry = _get_registry()
-    place_api_id: Optional[str] = None
+    # ------------------------------------------------------------------
+    # Travel mode (city is set)
+    # ------------------------------------------------------------------
     if city:
         place_api_id = await registry.resolve_place(city)
         if place_api_id is None:
@@ -506,118 +384,121 @@ async def search_events(
                     )
                 messages.append(
                     f"[agent] \"{city}\" is not a recognized Luma city. "
-                    f"Pick the best match and rerun, or clarify with the user if ambiguous.\n"
+                    f"Pick the best match and rerun, or clarify with the user.\n"
                     f"Closest: {options}"
                 )
                 return {"events": [], "count": 0, "messages": messages}
 
-    category_api_id: Optional[str] = None
-    if category:
-        category_api_id = await registry.resolve_category(category)
-        if category_api_id is None:
-            match = await registry.match_category(category)
-            if match.exact and match.slug:
-                category = match.slug
-                category_api_id = await registry.resolve_category(category)
-            else:
-                if match.candidates:
-                    options = ", ".join(match.candidates)
-                else:
-                    cat_names = await registry.get_category_names()
-                    options = ", ".join(
-                        f"{s} ({cat_names[s]})" if s in cat_names else s
-                        for s in await registry.category_slugs()
-                    )
-                messages.append(
-                    f"[agent] \"{category}\" is not a recognized Luma category. "
-                    f"Pick the best match and rerun, or clarify with the user if ambiguous.\n"
-                    f"Available: {options}"
-                )
-                return {"events": [], "count": 0, "messages": messages}
-
-    # Luma's API ignores category when place is also set, and when logged in
-    # the category-only endpoint returns only the user's home-area events.
-    # Strategy: always use place when available; apply category as client-side
-    # keyword filtering so it works reliably for any city.
-    category_keywords: Optional[list[str]] = None
-    if category_api_id and place_api_id:
-        category_keywords = await registry.category_keywords(category)
-        effective_place = place_api_id
-        effective_category = None
-    elif category_api_id:
-        effective_place = None
-        effective_category = category_api_id
-    else:
-        effective_place = place_api_id
-        effective_category = None
-
-    # Discover
-    try:
-        web = _get_web_client(session_cookie)
-        discover = await web.discover_events(
-            place_api_id=effective_place,
-            category_api_id=effective_category,
-            after=after_dt,
-            before=before_dt,
-        )
-        event_lists.append(discover)
-    except Exception as e:
-        messages.append(f"Discover source error: {e}")
-
-    # Subscribed calendars (only if logged in)
-    if session_cookie:
         try:
             web = _get_web_client(session_cookie)
-            subscribed = await web.subscribed_calendar_events()
-            event_lists.append(subscribed)
+            discover = await web.discover_events(
+                place_api_id=place_api_id,
+                after=after_dt, before=before_dt,
+            )
+            event_lists.append(discover)
         except Exception as e:
-            messages.append(f"Subscribed calendars error: {e}")
+            messages.append(f"Discover source error: {e}")
 
-    events = _backfill_known_coords(merge_events(event_lists))
+        if session_cookie:
+            try:
+                web = _get_web_client(session_cookie)
+                subscribed = await web.subscribed_calendar_events()
+                event_lists.append(subscribed)
+            except Exception as e:
+                messages.append(f"Subscribed calendars error: {e}")
 
+        events = _backfill_known_coords(merge_events(event_lists))
+
+        # City-center distance filter (25mi, exclude unknown coords)
+        places = await registry.get_places()
+        info = places.get(city)
+        if info:
+            _pid, clat, clon = info
+            events = filter_by_distance(
+                events, clat, clon, 25.0, exclude_unknown_location=True,
+            )
+
+        # Auto-detect latin_only from continent
+        if latin_only is None:
+            continent = await registry.continent_of(city)
+            latin_only = continent != "apac"
+
+    # ------------------------------------------------------------------
+    # Home mode (no city)
+    # ------------------------------------------------------------------
+    else:
+        default_categories, stored_address, stored_dist = _resolve_home_prefs(store)
+
+        eff_dist = max_distance_miles or stored_dist
+
+        # Determine which category API calls to make
+        categories_to_fetch: list[str] = []
+        if category:
+            cat_api_id = await registry.resolve_category(category)
+            if cat_api_id is None:
+                valid = await registry.category_slugs()
+                messages.append(
+                    f"[agent] \"{category}\" is not a valid category. "
+                    f"Must be one of: {', '.join(valid)}. "
+                    "Translate the user's intent to an exact slug and retry."
+                )
+                return {"events": [], "count": 0, "messages": messages}
+            categories_to_fetch = [category]
+        elif default_categories:
+            categories_to_fetch = default_categories
+
+        web = _get_web_client(session_cookie)
+
+        if categories_to_fetch:
+            for cat_slug in categories_to_fetch:
+                cat_api_id = await registry.resolve_category(cat_slug)
+                if not cat_api_id:
+                    continue
+                try:
+                    cat_events = await web.discover_events(
+                        category_api_id=cat_api_id,
+                        after=after_dt, before=before_dt,
+                    )
+                    event_lists.append(cat_events)
+                except Exception as e:
+                    messages.append(f"Category '{cat_slug}' error: {e}")
+        else:
+            # Raw Discover feed — no category, no place, just popular near you
+            try:
+                discover = await web.discover_events(
+                    after=after_dt, before=before_dt,
+                )
+                event_lists.append(discover)
+            except Exception as e:
+                messages.append(f"Discover source error: {e}")
+
+        if session_cookie:
+            try:
+                subscribed = await web.subscribed_calendar_events()
+                event_lists.append(subscribed)
+            except Exception as e:
+                messages.append(f"Subscribed calendars error: {e}")
+
+        events = _backfill_known_coords(merge_events(event_lists))
+
+        # Distance filter from stored address
+        if stored_address and eff_dist:
+            resolved_lat, resolved_lon = _geocode_fn(stored_address)
+            if resolved_lat is not None and resolved_lon is not None:
+                events = filter_by_distance(
+                    events, resolved_lat, resolved_lon, eff_dist,
+                )
+
+        if latin_only is None:
+            latin_only = True
+
+    # ------------------------------------------------------------------
+    # Common post-processing
+    # ------------------------------------------------------------------
     if after_dt:
         events = [e for e in events if e.start_at >= after_dt]
     if before_dt:
         events = [e for e in events if e.start_at <= before_dt]
-
-    filter_lat, filter_lon, filter_dist = resolved_lat, resolved_lon, max_dist
-    drop_unknown = exclude_unknown_location
-
-    # When there's no explicit address to filter around, fall back to the
-    # city center so subscribed-calendar events (which are global) get
-    # geo-filtered properly.
-    if filter_lat is None and city:
-        home_city = _stored_default(store, "default_city")
-        places = await registry.get_places()
-        info = places.get(city)
-        if info:
-            _pid, filter_lat, filter_lon = info
-            if filter_dist is None:
-                filter_dist = 25.0
-            if city != home_city:
-                drop_unknown = True
-
-    if filter_lat is not None and filter_lon is not None and filter_dist is not None:
-        events = filter_by_distance(
-            events,
-            filter_lat,
-            filter_lon,
-            filter_dist,
-            exclude_unknown_location=drop_unknown,
-        )
-
-    # When both city + category are requested, the API can't filter both
-    # server-side — we fetch the city's events and filter by category keywords.
-    if category_keywords:
-        events = filter_by_keywords(events, category_keywords)
-
-    if keywords:
-        events = filter_by_keywords(events, keywords)
-
-    # Auto-detect latin_only from city continent when not explicitly set
-    if latin_only is None:
-        continent = await registry.continent_of(city) if city else None
-        latin_only = continent != "apac"
 
     if latin_only:
         events = [e for e in events if _is_latin_event(e)]
@@ -649,14 +530,49 @@ async def search_events(
     elif sort == "newest":
         summaries.sort(key=lambda s: s.get("first_seen_at") or "", reverse=True)
 
-    # Category prompt — last in message order, only when not set anywhere
-    if not category and not _stored_default(store, "default_category"):
-        cat_list = ", ".join(await _get_registry().category_slugs())
-        messages.append(
-            "[agent] No category filter is set. Ask the user if they want to "
-            "filter by a category. If they pick one, rerun search_events "
-            f"with category=\"...\".\n\nAvailable: {cat_list}"
-        )
+    # ------------------------------------------------------------------
+    # Sequential onboarding prompts (one per call, in priority order)
+    # ------------------------------------------------------------------
+    if not city:
+        cats_raw = _stored_default(store, "default_categories")
+        has_categories = bool(cats_raw and _json.loads(cats_raw))
+        has_address = bool(_stored_default(store, "default_center_address"))
+        cats_declined = bool(_stored_default(store, "categories_declined"))
+        addr_declined = bool(_stored_default(store, "address_declined"))
+
+        if not has_categories and not cats_declined and not category:
+            cat_list = ", ".join(await registry.category_slugs())
+            messages.append(
+                "[agent] No default categories set. Ask the user which topics "
+                "interest them. Translate their answer to exact slugs and call "
+                f"set_preferences(categories=[...]). Available: {cat_list}\n\n"
+                "If the user says 'not now', do nothing (will ask again next time).\n"
+                "If the user says 'never', call set_preferences(skip_categories=true)."
+            )
+        elif not has_address and not addr_declined:
+            messages.append(
+                "[agent] No home address set for distance filtering. Ask the user "
+                "for their address and preferred radius, then call "
+                "set_preferences(address=\"...\", max_distance_miles=N).\n\n"
+                "If the user says 'not now', do nothing.\n"
+                "If the user says 'never', call set_preferences(skip_address=true)."
+            )
+        elif not session_cookie and not _login_prompted:
+            declined_row = store.get_setting("luma_login_declined_until")
+            login_declined = False
+            if declined_row:
+                declined_until = datetime.fromisoformat(declined_row[0])
+                login_declined = datetime.now(tz=timezone.utc) < declined_until
+            if not login_declined:
+                messages.append(
+                    "[agent] Results above are from Luma Discover (public events). "
+                    "The user can also log in to see events from calendars they "
+                    "follow on Luma, which may surface more results. Ask if they "
+                    "want to connect their Luma account.\n\n"
+                    "On yes: call search_events with login=true\n"
+                    "On no: call search_events with skip_login_days=0\n"
+                    "On never: call search_events with skip_login_days=-1"
+                )
 
     return {
         "events": summaries,

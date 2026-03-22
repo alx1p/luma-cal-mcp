@@ -1,13 +1,27 @@
 # Luma Events MCP Server
 
-A [FastMCP](https://gofastmcp.com) server that discovers events from [Luma](https://luma.com) — combining the Discover feed and subscribed calendars — with distance filtering, keyword search, and ICS export. No API key required for basic discovery.
+A [FastMCP](https://gofastmcp.com) server that discovers events from [Luma](https://luma.com) — combining the Discover feed and subscribed calendars — with distance filtering and ICS export. No API key required for basic discovery.
+
+## How it works
+
+Luma's Discover API has two endpoints that behave very differently:
+
+- **Category search** (e.g. AI, Tech, Food) — returns hundreds of events with rich tagging, but only for your home region. Great depth, geographically locked.
+- **City search** (e.g. Paris, London, Tokyo) — returns a curated set of ~20–40 top/featured events for that city. Broad coverage, smaller set.
+
+This MCP uses both via two search modes:
+
+- **Home mode** (default, no `city` param) — searches your preferred categories via the Category API. Deep, rich results filtered by your stored address and distance.
+- **Travel mode** (pass a `city`) — fetches the curated top events for that city via the Place API.
+
+On first run, the server returns popular events near you (geo-biased by IP), then walks you through setting up categories, address, and login for progressively richer results.
 
 ## Tools
 
 | Tool | What it does |
 |------|-------------|
-| `search_events` | Search Discover and subscribed calendars. Filter by city, category, distance from address, keywords, date range, and recency. Event times in local timezone. |
-| `set_preferences` | Save default city, address, distance, and category. Persists in SQLite across restarts. |
+| `search_events` | **Home mode**: search by category with address/distance filtering. **Travel mode**: curated events for a specific city. |
+| `set_preferences` | Save default categories (list), address, and distance. Persists in SQLite across restarts. |
 | `get_event` | Fetch full details for a single event by API id or `lu.ma` URL. |
 | `export_event_ics` | Generate an ICS string for any event — paste into Apple Calendar, Google Calendar, Outlook, etc. |
 
@@ -39,23 +53,22 @@ playwright install chromium
 
 ### First run
 
-On first use, the server walks you through setup one step at a time:
+On first use, the server walks you through setup one prompt at a time (in this order):
 
-1. **Login** — asks whether to log in for subscribed calendars.
-2. **Location** — asks where to search (city or address). No events are returned until a location is configured via `set_preferences`.
+1. **Categories** — asks which topics interest you (from: tech, ai, food, arts, climate, fitness, wellness, crypto).
+2. **Address** — asks for your location and preferred search radius for distance filtering.
+3. **Login** — asks whether to log in for subscribed calendars.
 
-Each prompt appears once per call, so the agent handles them sequentially.
+Each prompt appears after returning results, so you see events immediately. After you configure a preference, the search reruns automatically and the next prompt appears. You can respond "not now" (prompt reappears next time) or "never" (permanently dismissed).
 
 ### Configure
 
 Use `set_preferences` to save defaults that persist across restarts:
 
 ```
+set_preferences(categories=["ai", "tech"])
 set_preferences(address="3180 18th St, San Francisco", max_distance_miles=15)
-set_preferences(category="ai")
 ```
-
-When you provide an address without a city, the nearest Luma region is inferred automatically. You can also set `city` explicitly (e.g. `city="sf"`).
 
 ### Run
 
@@ -73,7 +86,7 @@ Subscribed calendars require a Luma session cookie. The server handles this auto
 
 **How it works:**
 
-1. **First call** — the server prompts for login. The agent asks you in chat.
+1. **First call** — after results, the server prompts for login. The agent asks you in chat.
 2. **Login** — the agent calls `search_events` with `login=true`. A Chromium browser opens to `lu.ma/signin`; log in normally. The session cookie is stored in the local SQLite DB.
 3. **Decline** — the agent calls `search_events` with `skip_login_days=N` to defer (0 = ask next time, -1 = never).
 4. **Returning user, cookie expired** — the browser opens automatically for re-authentication.
@@ -83,10 +96,10 @@ Subscribed calendars require a Luma session cookie. The server handles this auto
 
 The server maintains a local SQLite database (`~/.luma-mcp/events.db` by default) that records the first time each event is seen. This enables two filters on `search_events`:
 
-- **`added_within_days`** — only return events first seen within the last N days (e.g. `added_within_days=5` for events discovered in the past week).
-- **`new_only`** — only return events that have never been seen before (first appearance this run).
+- **`added_within_days`** — only return events first seen within the last N days.
+- **`new_only`** — only return events that have never been seen before.
 
-Every result also includes `first_seen_at` (ISO timestamp) and `is_new` (boolean). The store builds up over repeated runs, so after regular use you can reliably ask "what's new since last time."
+Every result also includes `first_seen_at` (ISO timestamp) and `is_new` (boolean).
 
 ## Cursor MCP Configuration
 
@@ -112,8 +125,6 @@ Add to your Cursor MCP settings (`.cursor/mcp.json`):
 
 ## Data Sources
 
-The server pulls events from up to two sources and merges them:
-
 | Source | Auth | Coverage |
 |--------|------|----------|
 | **Discover** (`api.lu.ma`) | None required | Public events by city and category — same feed as [luma.com/discover](https://luma.com/discover) |
@@ -123,13 +134,13 @@ Without logging in, the server still works — Discover is fully available with 
 
 ## Distance Filtering
 
-Provide a street address via `set_preferences(address="...")` or as `center_address` on `search_events`, plus `max_distance_miles`. Events beyond the radius are excluded. Events without location data are included by default (with `distance_miles: null`), or excluded if `exclude_unknown_location` is set.
+Set a home address via `set_preferences(address="...")` with `max_distance_miles`. In home mode, events beyond the radius are excluded. Events without location data are included by default (with `distance_miles: null`). In travel mode, distance filtering uses the city center at 25 miles automatically.
 
 Geocoding uses [Nominatim](https://nominatim.org/) (free, OpenStreetMap) by default. For higher volume, set `GEOCODING_PROVIDER=google` or `mapbox` with the corresponding `GEOCODING_API_KEY` in your environment.
 
 ## Event Times
 
-Event times (`start_at`, `end_at`) are returned in each event's local timezone as reported by Luma (e.g. `America/Los_Angeles`), not UTC. The `timezone` field is included in every result for reference.
+Event times (`start_at`, `end_at`) are returned in the user's system timezone. The `timezone` field from Luma is included in every result for reference.
 
 ## Limitations
 

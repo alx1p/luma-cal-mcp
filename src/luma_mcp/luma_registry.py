@@ -185,22 +185,6 @@ _FALLBACK_CATEGORY_NAMES: dict[str, str] = {
     "wellness": "Wellness", "crypto": "Crypto",
 }
 
-_CATEGORY_ALIASES: dict[str, str] = {
-    "artificial intelligence": "ai", "machine learning": "ai", "aiml": "ai",
-    "ml": "ai", "deep learning": "ai", "gen ai": "ai", "genai": "ai",
-    "technology": "tech", "software": "tech", "engineering": "tech",
-    "web3": "crypto", "blockchain": "crypto", "defi": "crypto",
-    "bitcoin": "crypto", "ethereum": "crypto",
-    "food and drink": "food", "food & drink": "food",
-    "dining": "food", "restaurant": "food", "restaurants": "food",
-    "art": "arts", "culture": "arts", "arts and culture": "arts",
-    "music": "arts", "theater": "arts", "theatre": "arts",
-    "health": "wellness", "meditation": "wellness", "mindfulness": "wellness",
-    "yoga": "fitness", "exercise": "fitness", "gym": "fitness",
-    "sports": "fitness", "running": "fitness", "workout": "fitness",
-    "sustainability": "climate", "environment": "climate", "green": "climate",
-    "cleantech": "climate", "clean energy": "climate",
-}
 
 
 # ------------------------------------------------------------------
@@ -553,22 +537,3 @@ class LumaRegistry:
         names = await self.get_place_names()
         return _fuzzy_match(input_str, list(places.keys()), names)
 
-    async def match_category(self, input_str: str) -> MatchResult:
-        """Fuzzy-match a user-supplied category string to a known Luma slug."""
-        cats = await self.get_categories()
-        names = await self.get_category_names()
-        return _fuzzy_match(input_str, list(cats.keys()), names, _CATEGORY_ALIASES)
-
-    async def category_keywords(self, category_slug: str) -> list[str]:
-        """Return keyword terms for client-side filtering of a category.
-
-        Includes the slug itself, the display name, and all known aliases.
-        """
-        terms: list[str] = [category_slug]
-        names = await self.get_category_names()
-        if category_slug in names:
-            terms.append(names[category_slug])
-        for alias, target in _CATEGORY_ALIASES.items():
-            if target == category_slug:
-                terms.append(alias)
-        return terms
