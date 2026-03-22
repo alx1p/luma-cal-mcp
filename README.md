@@ -21,7 +21,7 @@ On first run, the server returns popular events near you (geo-biased by IP), the
 | Tool | What it does |
 |------|-------------|
 | `search_events` | **Home mode**: search by category with address/distance filtering. **Travel mode**: curated events for a specific city. |
-| `set_preferences` | Save default categories (list), address, and distance. Persists in SQLite across restarts. |
+| `set_preferences` | Save default categories (list), address, and max distance. Persists in SQLite across restarts. |
 | `get_event` | Fetch full details for a single event by API id or `lu.ma` URL. |
 | `export_event_ics` | Generate an ICS string for any event — paste into Apple Calendar, Google Calendar, Outlook, etc. |
 
