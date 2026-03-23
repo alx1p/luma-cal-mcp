@@ -1,8 +1,18 @@
 [project]
 name = "luma-mcp"
 version = "0.1.0"
-description = "FastMCP server for Luma event discovery, filtering, and calendar export"
+description = "MCP server for Luma event discovery — search by category, city, distance, and keywords with calendar export"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
+authors = [{ name = "Alex Petrov", url = "https://github.com/alx1p" }]
+keywords = ["mcp", "luma", "events", "calendar", "fastmcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Communications :: Conferencing",
+]
 dependencies = [
     "fastmcp",
     "httpx",
@@ -13,6 +23,11 @@ dependencies = [
 
 [project.optional-dependencies]
 auth = ["playwright"]
+
+[project.urls]
+Homepage = "https://github.com/alx1p/luma-cal-mcp"
+Repository = "https://github.com/alx1p/luma-cal-mcp"
+Issues = "https://github.com/alx1p/luma-cal-mcp/issues"
 
 [project.scripts]
 luma-mcp = "luma_mcp.server:main"

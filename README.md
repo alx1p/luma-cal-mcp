@@ -1,5 +1,7 @@
 # Luma Events MCP Server
 
+<!-- mcp-name: io.github.alx1p/luma-mcp -->
+
 A [FastMCP](https://gofastmcp.com) server that discovers events from [Luma](https://luma.com) — combining the Discover feed and subscribed calendars — with distance filtering and ICS export. No API key required for basic discovery.
 
 ## How it works
