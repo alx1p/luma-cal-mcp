@@ -22,9 +22,11 @@ class EventStore:
                 event_url   TEXT PRIMARY KEY,
                 event_id    TEXT,
                 title       TEXT,
-                first_seen  TEXT NOT NULL
+                first_seen  TEXT NOT NULL,
+                start_at    TEXT
             )"""
         )
+        self._migrate_add_start_at()
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS settings (
                 key     TEXT PRIMARY KEY,
@@ -34,6 +36,16 @@ class EventStore:
         )
         self._conn.commit()
 
+    def _migrate_add_start_at(self) -> None:
+        """Add start_at column to existing databases that lack it."""
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(seen_events)").fetchall()
+        }
+        if "start_at" not in cols:
+            self._conn.execute("ALTER TABLE seen_events ADD COLUMN start_at TEXT")
+            self._conn.commit()
+
     def record(self, events: list[dict]) -> list[str]:
         """Record events, returning URLs of newly seen events."""
         now = datetime.now(tz=timezone.utc).isoformat()
@@ -42,17 +54,31 @@ class EventStore:
             url = ev.get("url", "")
             if not url:
                 continue
+            start = ev.get("start_at", "")
             try:
                 self._conn.execute(
-                    "INSERT INTO seen_events (event_url, event_id, title, first_seen) "
-                    "VALUES (?, ?, ?, ?)",
-                    (url, ev.get("id", ""), ev.get("title", ""), now),
+                    "INSERT INTO seen_events (event_url, event_id, title, first_seen, start_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (url, ev.get("id", ""), ev.get("title", ""), now, start),
                 )
                 new_urls.append(url)
             except sqlite3.IntegrityError:
                 pass
         self._conn.commit()
         return new_urls
+
+    def prune_past_events(self, before: Optional[datetime] = None) -> int:
+        """Delete events whose start_at is before the given datetime (default: now).
+
+        Returns the number of deleted rows.
+        """
+        cutoff = (before or datetime.now(tz=timezone.utc)).isoformat()
+        cursor = self._conn.execute(
+            "DELETE FROM seen_events WHERE start_at IS NOT NULL AND start_at < ?",
+            (cutoff,),
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     def first_seen(self, event_url: str) -> Optional[datetime]:
         row = self._conn.execute(

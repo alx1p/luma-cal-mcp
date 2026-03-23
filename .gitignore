@@ -8,3 +8,4 @@ dist/
 *.egg-info/
 .ruff_cache/
 .mypy_cache/
+.mcpregistry_*
