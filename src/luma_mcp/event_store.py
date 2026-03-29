@@ -68,11 +68,17 @@ class EventStore:
         return new_urls
 
     def prune_past_events(self, before: Optional[datetime] = None) -> int:
-        """Delete events whose start_at is before the given datetime (default: now).
+        """Delete events whose start_at is before the given datetime.
+
+        Default cutoff is 24 hours ago, not now — this prevents events that
+        already started but are still returned by the API from being pruned
+        and then re-discovered as "new" on every search.
 
         Returns the number of deleted rows.
         """
-        cutoff = (before or datetime.now(tz=timezone.utc)).isoformat()
+        from datetime import timedelta
+
+        cutoff = (before or datetime.now(tz=timezone.utc) - timedelta(hours=24)).isoformat()
         cursor = self._conn.execute(
             "DELETE FROM seen_events WHERE start_at IS NOT NULL AND start_at < ?",
             (cutoff,),
