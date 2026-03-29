@@ -366,6 +366,8 @@ async def search_events(
     store = _get_event_store()
     registry = _get_registry()
 
+    store.prune_past_events()
+
     # Session handling (login / skip / existing cookie)
     session_cookie, _login_prompted = await _resolve_session(
         store, messages,
@@ -525,13 +527,13 @@ async def search_events(
 
     summaries = [_event_summary(e) for e in events]
 
-    new_urls = set(store.record(summaries))
     seen_times = store.first_seen_batch([s["url"] for s in summaries])
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
 
     for s in summaries:
         fs = seen_times.get(s["url"])
-        s["first_seen_at"] = fs.isoformat() if fs else None
-        s["is_new"] = s["url"] in new_urls
+        s["first_seen_at"] = fs.isoformat() if fs else now_iso
+        s["is_new"] = s["url"] not in seen_times
 
     if new_only:
         summaries = [s for s in summaries if s["is_new"]]
@@ -547,6 +549,9 @@ async def search_events(
         summaries.sort(key=lambda s: s.get("distance_miles", float("inf")))
     elif sort == "newest":
         summaries.sort(key=lambda s: s.get("first_seen_at") or "", reverse=True)
+
+    # Only record events that survive all filters (i.e. will be shown to the user)
+    store.record(summaries)
 
     # ------------------------------------------------------------------
     # Sequential onboarding prompts (one per call, in priority order)
