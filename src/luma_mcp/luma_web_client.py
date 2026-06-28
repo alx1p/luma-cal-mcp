@@ -34,7 +34,7 @@ class LumaWebClient:
             else:
                 headers["cookie"] = f"luma.auth-session-key={session_cookie}"
         self._client = httpx.AsyncClient(
-            base_url=BASE_URL, headers=headers, timeout=30.0
+            base_url=BASE_URL, headers=headers, timeout=30.0, follow_redirects=True
         )
         self._has_session = bool(session_cookie)
 
@@ -109,7 +109,7 @@ class LumaWebClient:
         if not self._has_session:
             return []
 
-        resp = await self._client.get("/home/get-subscribed-calendars")
+        resp = await self._client.get("/home/get-following-calendars")
         if resp.status_code in (401, 403, 404):
             return []
         resp.raise_for_status()

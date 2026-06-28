@@ -8,7 +8,7 @@ import httpx
 
 _LOGIN_URL = "https://lu.ma/signin"
 _COOKIE_NAME = "luma.auth-session-key"
-_VALIDATE_URL = "https://api.lu.ma/home/get-subscribed-calendars"
+_VALIDATE_URL = "https://api.lu.ma/home/get-following-calendars"
 _LOGIN_TIMEOUT_S = 120
 _POLL_INTERVAL_S = 1
 
@@ -68,7 +68,7 @@ async def validate_session(cookie: str) -> bool:
         "origin": "https://lu.ma",
         "referer": "https://lu.ma/",
     }
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         try:
             resp = await client.get(_VALIDATE_URL, headers=headers)
             return resp.status_code == 200
